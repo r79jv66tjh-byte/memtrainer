@@ -1,0 +1,18 @@
+{
+  "name": "MemTrainer",
+  "entry": "memtrainer.py",
+  "pyinstaller": [
+    "--collect-all",
+    "capstone",
+    "--add-data",
+    "trainer_app.py;.",
+    "--add-data",
+    "scanner_core.py;.",
+    "--add-data",
+    "trainer_core.py;.",
+    "--add-data",
+    "aob.py;.",
+    "--add-data",
+    "speedhack.py;."
+  ]
+}
