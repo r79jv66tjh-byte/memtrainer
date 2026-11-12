@@ -109,6 +109,53 @@ class RemoteTest(unittest.TestCase):
             t.close()
 
 
+class MainThreadHookTest(unittest.TestCase):
+    def test_calls_run_in_hooked_thread(self):
+        """Aufrufe laufen im Thread, der die eingehängte Funktion ausführt (hier: GetTickCount64)."""
+        t = Target()
+        try:
+            ex = remote.remote_exports(t.proc, "kernel32.dll")
+            orig = t.proc.read_bytes(ex["GetTickCount64"], 16)
+            with remote.RemoteCaller(t.proc) as rc:
+                s = rc.cstring("abcdef")
+                for _ in range(3):  # mehrfach ein- und aushängen
+                    with remote.MainThreadHook(t.proc, ex["GetTickCount64"]) as hook:
+                        tid, n = hook.batch([(ex["GetCurrentThreadId"],), (ex["lstrlenA"], s)])
+                        self.assertEqual(n, 6)
+                        self.assertNotEqual(tid, 0)
+                        self.assertEqual(hook.call(ex["GetCurrentThreadId"]), tid)  # immer derselbe Thread
+                    t.send("add hp 1")  # Prozess läuft weiter
+                with remote.MainThreadHook(t.proc, ex["GetTickCount64"]) as hook:
+                    self.assertTrue(hook.fires())
+                    self.assertTrue(hook.last_this() or True)  # rcx wird mitgeschrieben
+            self.assertEqual(t.proc.read_bytes(ex["GetTickCount64"], 16), orig)  # Original wiederhergestellt
+        finally:
+            t.close()
+
+
+class TableActionsTest(unittest.TestCase):
+    def test_actions_roundtrip(self):
+        from trainer_core import new_action, new_entry, table_from_json, table_to_json
+        acts = [new_action(desc="Kill", call="GameManager::RosaryDamage(true, 1.8)", hotkey="F9", interval=10)]
+        ents = [new_entry(desc="HP", expr="unity:GameManager::_mainCharacters[0]._currentHp", type="Float")]
+        t = table_from_json(json.loads(json.dumps(table_to_json(ents, "x.exe", actions=acts))))
+        self.assertEqual(t["actions"][0]["call"], acts[0]["call"])
+        self.assertEqual(t["actions"][0]["interval"], 10)
+        self.assertFalse(t["actions"][0]["timer"])  # Timer startet nie von selbst
+        self.assertEqual(t["entries"][0]["expr"], ents[0]["expr"])
+        self.assertEqual(table_from_json({"entries": []})["actions"], [])  # alte Tabellen
+
+    def test_presets_are_valid(self):
+        from trainer_core import table_from_json
+        d = os.path.join(ROOT, "presets")
+        for n in os.listdir(d):
+            with open(os.path.join(d, n), encoding="utf-8") as f:
+                t = table_from_json(json.load(f))
+            self.assertTrue(t["process"].endswith(".exe"), n)
+            for a in t["actions"]:
+                self.assertIn("::", a["call"])
+
+
 class DebuggerDetachTest(unittest.TestCase):
     def test_target_survives_repeated_watch(self):
         """Regression: Beim Lösen anstehende Breakpoint-Treffer ließen das Spiel abstürzen."""

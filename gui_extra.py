@@ -445,6 +445,7 @@ class UnityWindow(Tool):
         ttk.Checkbutton(sbar, text="Nur Zahlen", variable=self.numeric, command=self.search).pack(side="left", padx=6)
         self.ui = tk.BooleanVar(value=False)
         ttk.Checkbutton(sbar, text="UI-Klassen zeigen", variable=self.ui, command=self.search).pack(side="left")
+        ttk.Button(sbar, text="Methoden der Klasse…", command=self.methods).pack(side="right")
 
         pw = ttk.PanedWindow(self, orient="vertical")
         pw.pack(fill="both", expand=True, padx=6, pady=6)
@@ -510,11 +511,19 @@ class UnityWindow(Tool):
             if err:
                 self.status.config(text=f"Fehler: {err}", foreground="#b00")
                 return
-            app.unity = res
+            app.set_unity(res)
             self.status.config(text=f"{res.kind.upper()}: {len(res.classes)} Klassen, "
                                     f"{sum(len(c.fields) for c in res.classes)} Felder", foreground="#070")
             self.search()
         self.run_bg(work, done)
+
+    def methods(self):
+        s = self.tv.selection()
+        if not s or not getattr(self.app, "unity", None):
+            messagebox.showinfo("Methoden", "Erst eine Zeile (Klasse) in der Liste wählen.", parent=self)
+            return
+        import gui_actions
+        gui_actions.MethodsWindow(self.app, self.results[s[0]].cls)
 
     def search(self):
         u = getattr(self.app, "unity", None)

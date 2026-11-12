@@ -6,6 +6,8 @@ Adress-Ausdruck-Syntax (wie Cheat Engine):
     spiel.exe+1A2B                Modul + Offset
     [[spiel.exe+1A2B]+10]+48      Pointer-Kette ([x] = Zeiger an Adresse x lesen)
     "Mein Spiel.exe"+10           Modulnamen mit Leer-/Sonderzeichen in Anfuehrungszeichen
+    unity:GameManager::_mainCharacters[0]._currentHp
+                                  Unity-Pfad (lebendes Objekt -> Felder), uebersteht Neustarts
 """
 import re
 
@@ -81,11 +83,20 @@ class CheatRunner:
     def __init__(self, proc):
         self.proc = proc
         self._patch_addr = {}
+        self.unity = None  # UnityRuntime für 'unity:'-Pfade (optional)
 
     def address(self, e):
         if e["type"] == PATCH:
             return self._patch_address(e)
-        return resolve_expr(self.proc, e["expr"])
+        expr = str(e["expr"])
+        if expr.startswith("unity:"):
+            if self.unity is None:
+                return None
+            try:
+                return self.unity.resolve_path(expr[6:])[0]
+            except Exception:  # noqa: BLE001 - ungültiger Pfad / Spiel im Ladebildschirm
+                return None
+        return resolve_expr(self.proc, expr)
 
     def _patch_address(self, e):
         key = id(e)
@@ -191,9 +202,20 @@ SAVE_KEYS = ("desc", "expr", "type", "group", "active", "value", "mode", "hotkey
              "orig", "new", "aob", "aob_module", "aob_offset")
 
 
-def table_to_json(entries, process="", title="", speed=None):
-    return {"version": 2, "title": title, "process": process, "speed": speed or {},
-            "entries": [{k: e.get(k) for k in SAVE_KEYS} for e in entries]}
+ACTION_KEYS = ("desc", "call", "hotkey", "interval")
+
+
+def new_action(**kw):
+    """Aktion = Spiel-Methode aufrufen (Unity), per Hotkey und/oder alle 'interval' Sekunden (Timer)."""
+    a = {"desc": "Neue Aktion", "call": "", "hotkey": "", "interval": 0.0, "timer": False}
+    a.update(kw)
+    return a
+
+
+def table_to_json(entries, process="", title="", speed=None, actions=()):
+    return {"version": 3, "title": title, "process": process, "speed": speed or {},
+            "entries": [{k: e.get(k) for k in SAVE_KEYS} for e in entries],
+            "actions": [{k: a.get(k) for k in ACTION_KEYS} for a in actions]}
 
 
 def table_from_json(data):
@@ -212,5 +234,7 @@ def table_from_json(data):
             if d.get("fval") is not None:
                 d["active"], d["value"] = True, d["fval"]
         entries.append(new_entry(**{k: d[k] for k in SAVE_KEYS if k in d and d[k] is not None}))
+    actions = [new_action(**{k: a[k] for k in ACTION_KEYS if a.get(k) is not None})
+               for a in data.get("actions", []) if isinstance(a, dict)]
     return {"title": data.get("title", ""), "process": data.get("process", ""),
-            "speed": data.get("speed") or {}, "entries": entries}
+            "speed": data.get("speed") or {}, "entries": entries, "actions": actions}

@@ -13,6 +13,8 @@
     "--add-data",
     "aob.py;.",
     "--add-data",
-    "speedhack.py;."
+    "speedhack.py;.",
+    "--add-data",
+    "presets;presets"
   ]
 }

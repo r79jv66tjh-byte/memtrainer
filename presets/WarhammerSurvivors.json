@@ -1,0 +1,31 @@
+{
+  "version": 3,
+  "title": "Warhammer Survivors (Demo) – Preset",
+  "process": "WarhammerSurvivors.exe",
+  "speed": {},
+  "entries": [
+    {"desc": "Münzen", "expr": "unity:GameManager::_playerOptions._currentSiloSaveData.Coins",
+     "type": "Float", "group": "Spielstand", "hotkey": "F5", "hk_action": "add", "hk_value": 1000},
+    {"desc": "Leben", "expr": "unity:GameManager::_mainCharacters[0]._currentHp",
+     "type": "Float", "group": "Spieler", "hotkey": "F1", "hk_action": "toggle"},
+    {"desc": "Unverwundbar (1 = an)", "expr": "unity:GameManager::_mainCharacters[0]._isInvul",
+     "type": "Byte", "group": "Spieler", "value": 1, "hotkey": "F2", "hk_action": "toggle"},
+    {"desc": "Level", "expr": "unity:GameManager::_mainCharacters[0]._level",
+     "type": "4 Bytes", "group": "Spieler"},
+    {"desc": "XP (+500 per Hotkey)", "expr": "unity:GameManager::_mainCharacters[0]._xp",
+     "type": "Float", "group": "Spieler", "hotkey": "F3", "hk_action": "add", "hk_value": 500},
+    {"desc": "Laufgeschwindigkeit (Faktor)", "expr": "unity:GameManager::_mainCharacters[0].MoveSpeedMultiplier",
+     "type": "Float", "group": "Spieler"}
+  ],
+  "actions": [
+    {"desc": "Kill-all (Rosenkranz)", "call": "GameManager::RosaryDamage(true, 1.8)",
+     "hotkey": "F9", "interval": 10},
+    {"desc": "Kill-all leise (für Timer)", "call": "GameManager::RosaryDamage(false, 0)",
+     "hotkey": "", "interval": 3},
+    {"desc": "Spielstand speichern (mit Backup)", "call": "GameManager::_playerOptions.Save(true, true)",
+     "hotkey": "", "interval": 0},
+    {"desc": "Alles freischalten (dauerhaft!)",
+     "call": "GameManager::_playerOptions.UnlockCharacter(keys:_playerOptions._dataManager._characterData); GameManager::_playerOptions.UnlockWeapon(keys:_playerOptions._dataManager._weaponData); GameManager::_playerOptions.UnlockStage(keys:_playerOptions._dataManager._stageData); GameManager::_playerOptions.UnlockPowerUp(keys:_playerOptions._dataManager._powerUpData); GameManager::_playerOptions.Save(true, true)",
+     "hotkey": "", "interval": 0}
+  ]
+}

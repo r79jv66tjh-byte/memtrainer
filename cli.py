@@ -11,6 +11,9 @@ Beispiele:
   python cli.py monitor --process game.exe --expr 7FF6A1B2C3D0 --type Float --seconds 5
   python cli.py unity-search --process game.exe --query coins
   python cli.py unity-objects --process game.exe --class PlayerOptionsData --field Coins
+  python cli.py read --process game.exe --expr "unity:GameManager::_mainCharacters[0]._currentHp" --type Float
+  python cli.py unity-methods --process game.exe --class GameManager --query rosary
+  python cli.py unity-call --process game.exe --call "GameManager::RosaryDamage(true, 1.8)" --dry-run
 """
 import argparse
 import json
@@ -58,8 +61,21 @@ def need_type(t):
     return TYPES[t]
 
 
+_UNITY = {}
+
+
 def addr_of(proc, expr):
-    a = resolve_expr(proc, expr)
+    if str(expr).startswith("unity:"):
+        u = _UNITY.get(proc.pid) or _unity(proc)
+        _UNITY[proc.pid] = u
+        try:
+            a = u.resolve_path(expr[6:])[0]
+        except Exception as e:  # noqa: BLE001
+            raise CliError(f"Unity-Pfad: {e}") from e
+        finally:
+            u.close_hook()
+    else:
+        a = resolve_expr(proc, expr)
     if a is None:
         raise CliError(f"Adresse '{expr}' ist ungültig oder ein Zeiger ist nicht lesbar.")
     return a
@@ -377,6 +393,45 @@ def cmd_unity_objects(a):
                  "beobachten, mit 'write' (type=mem_type) ändern."})
 
 
+def cmd_unity_methods(a):
+    p = open_process(a.process)
+    u = _unity(p)
+    cls = u.find_class(a.cls)
+    if not cls:
+        raise CliError(f"Klasse '{a.cls}' nicht gefunden.")
+    q = (a.query or "").lower()
+    rows = []
+    try:
+        k, depth = cls[0], 0
+        while k is not None and depth < (8 if a.inherited else 1):
+            rows += [{"class": k.name, "signature": m.signature, "callable": m.callable}
+                     for m in u.methods(k) if q in m.name.lower()]
+            k, depth = u.by_ptr.get(k.parent), depth + 1
+    except Exception as e:  # noqa: BLE001 - UnityError (z. B. Mono)
+        raise CliError(str(e)) from e
+    out({"process": p.name, "class": cls[0].full, "methods": rows[:a.limit],
+         "hint": "Aufruf mit unity-call --call \"Klasse::Methode(arg1, arg2)\". Enum-Argument '*' = alle Werte, "
+                 "'keys:feld.dict' = Schlüssel eines Dictionary (z. B. vorhandene Inhalte)."})
+
+
+def cmd_unity_call(a):
+    import unity
+    p = open_process(a.process)
+    u = _unity(p)
+    if a.dry_run:
+        out({"process": p.name, "call": a.call, "dry_run": True,
+             "hint": "Ruft eine Spiel-Methode im Hauptthread auf. Kann den Spielstand verändern."})
+        return
+    try:
+        res = u.run_call(a.call, timeout=a.timeout)
+    except (unity.UnityError, unity.RemoteError) as e:
+        raise CliError(str(e)) from e
+    finally:
+        u.close_hook()
+    out({"process": p.name, "call": a.call, "calls": len(res), "returns": [f"{r:X}" for r in res[:50]],
+         "alive": p.alive()})
+
+
 def cmd_aob(a):
     p = open_process(a.process)
     try:
@@ -517,6 +572,21 @@ def main(argv=None):
     s.add_argument("--field", required=True)
     s.add_argument("--limit", type=int, default=20)
     s.set_defaults(fn=cmd_unity_objects)
+
+    s = sub.add_parser("unity-methods")
+    s.add_argument("--process", required=True)
+    s.add_argument("--class", dest="cls", required=True)
+    s.add_argument("--query", default="")
+    s.add_argument("--inherited", action="store_true")
+    s.add_argument("--limit", type=int, default=200)
+    s.set_defaults(fn=cmd_unity_methods)
+
+    s = sub.add_parser("unity-call")
+    s.add_argument("--process", required=True)
+    s.add_argument("--call", required=True)
+    s.add_argument("--timeout", type=float, default=5.0)
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(fn=cmd_unity_call)
 
     s = sub.add_parser("aob")
     s.add_argument("--process", required=True)

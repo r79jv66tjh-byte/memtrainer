@@ -43,7 +43,11 @@ def _batch_code():
                  b"\x48\x8B\x53\x10"      # mov rdx,[rbx+10h]
                  b"\x4C\x8B\x43\x18"      # mov r8,[rbx+18h]
                  b"\x4C\x8B\x4B\x20"      # mov r9,[rbx+20h]
-                 b"\xFF\x13"              # call [rbx]
+                 b"\xF3\x0F\x7E\x43\x08"  # movq xmm0,[rbx+8]   (Float-/Double-Argumente: gleiche Position)
+                 b"\xF3\x0F\x7E\x4B\x10"  # movq xmm1,[rbx+10h]
+                 b"\xF3\x0F\x7E\x53\x18"  # movq xmm2,[rbx+18h]
+                 b"\xF3\x0F\x7E\x5B\x20"  # movq xmm3,[rbx+20h]
+                 b"\xFF\x13"           # call [rbx]
                  b"\x48\x89\x43\x28"      # mov [rbx+28h],rax
                  b"\x48\x83\xC3\x30"      # add rbx,30h
                  b"\x48\xFF\xCE")         # dec rsi
@@ -221,3 +225,192 @@ class RemoteCaller:
             return [struct.unpack_from("<Q", res, HEADER + i * ENTRY + 0x28)[0] for i in range(n)]
         finally:
             k32.VirtualFreeEx(self.h, mem, 0, MEM_RELEASE)
+
+
+# -- Aufrufe im Hauptthread ----------------------------------------------------------
+# Viele Spiel-Funktionen (Unity!) dürfen nur aus dem Hauptthread laufen. Dafür hängt sich
+# MainThreadHook an den Anfang einer Funktion, die das Spiel jedes Bild aufruft (z. B. ein
+# Update()). Der Einsprung prüft eine Marke; ist ein Auftrag da, arbeitet er ihn mit dem
+# Batch-Interpreter ab und läuft dann normal weiter.
+
+H_FLAG, H_REQ = 0x400, 0x408   # Marke (0 frei, 1 Auftrag, 3 läuft, 2 fertig), Zeiger auf Auftrag
+H_THIS = 0x410                 # rcx beim letzten Aufruf (bei Methoden: das Objekt, „this“)
+H_STUB = 0x200
+
+
+def _relocate(code, src, dst):
+    """Mindestens 5 Byte ab src nach dst verschieben (RIP-relative Adressen anpassen)."""
+    import capstone
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    md.detail = True
+    out, n = bytearray(), 0
+    for ins in md.disasm(code, src):
+        if ins.mnemonic in ("ret", "int3"):
+            raise RemoteError("Funktion ist zu kurz zum Einhängen.")
+        b = bytearray(ins.bytes)
+        new = dst + len(out)
+        if capstone.CS_GRP_BRANCH_RELATIVE in ins.groups:
+            if ins.mnemonic not in ("call", "jmp") or len(b) != 5:
+                raise RemoteError(f"Funktionsanfang nicht verschiebbar ({ins.mnemonic} {ins.op_str}).")
+            target = ins.operands[0].imm
+            b[1:5] = struct.pack("<i", target - (new + 5))
+        elif any(o.type == capstone.x86.X86_OP_MEM and o.mem.base == capstone.x86.X86_REG_RIP
+                 for o in ins.operands):
+            off = ins.disp_offset
+            disp = struct.unpack_from("<i", b, off)[0]
+            nd = disp + ins.address - new
+            if not -2**31 <= nd < 2**31:
+                raise RemoteError("Ausweichcode liegt zu weit weg.")
+            struct.pack_into("<i", b, off, nd)
+        out += b
+        n += ins.size
+        if n >= 5:
+            return bytes(out), n
+    raise RemoteError("Funktionsanfang nicht lesbar.")
+
+
+def _stub(base, relocated, back):
+    """Einsprung: Register sichern, ggf. Auftrag ausführen, Register zurück, Original weiter."""
+    here = base + H_STUB
+    s = bytearray()
+    s += b"\x48\x89\x0D" + struct.pack("<i", base + H_THIS - (here + 7))  # mov [this],rcx
+    s += b"\x50\x51\x52\x41\x50\x41\x51\x41\x52\x41\x53\x9C"   # push rax,rcx,rdx,r8-r11; pushfq
+    s += b"\x48\x81\xEC\x88\x00\x00\x00"                         # sub rsp,88h (ausgerichtet + Schatten)
+    for i in range(6):                                           # movdqu [rsp+20h+i*16],xmm i
+        s += b"\xF3\x0F\x7F" + bytes([0x44 | (i << 3), 0x24, 0x20 + i * 16])
+    s += b"\xB8\x01\x00\x00\x00"                                 # mov eax,1
+    s += b"\xB9\x03\x00\x00\x00"                                 # mov ecx,3
+    s += b"\xF0\x0F\xB1\x0D" + struct.pack("<i", base + H_FLAG - (here + len(s) + 8))  # lock cmpxchg [flag],ecx
+    s += b"\x75\x00"
+    jne = len(s) - 1
+    s += b"\x48\x8B\x0D" + struct.pack("<i", base + H_REQ - (here + len(s) + 7))      # mov rcx,[req]
+    s += b"\xE8" + struct.pack("<i", base - (here + len(s) + 5))                      # call Interpreter
+    s += b"\xC7\x05" + struct.pack("<i", base + H_FLAG - (here + len(s) + 10)) + b"\x02\x00\x00\x00"  # mov [flag],2
+    s[jne] = len(s) - jne - 1
+    for i in range(6):                                           # movdqu xmm i,[rsp+20h+i*16]
+        s += b"\xF3\x0F\x6F" + bytes([0x44 | (i << 3), 0x24, 0x20 + i * 16])
+    s += b"\x48\x81\xC4\x88\x00\x00\x00"                         # add rsp,88h
+    s += b"\x9D\x41\x5B\x41\x5A\x41\x59\x41\x58\x5A\x59\x58"   # popfq; pop r11..rax
+    rel_at = len(s)
+    s += relocated
+    s += b"\xFF\x25\x00\x00\x00\x00" + struct.pack("<Q", back)   # jmp [rip+0] -> zurück
+    return bytes(s), rel_at
+
+
+_OPEN_HOOKS = set()
+
+
+def _close_open_hooks():
+    for h in list(_OPEN_HOOKS):
+        try:
+            h.close()
+        except Exception:  # noqa: BLE001 - beim Beenden nichts mehr melden
+            pass
+
+
+import atexit  # noqa: E402
+
+atexit.register(_close_open_hooks)
+
+
+class MainThreadHook:
+    """Ruft Funktionen im Thread auf, der 'hook_addr' ausführt (z. B. Unitys Hauptthread).
+
+    Ablauf: hook = MainThreadHook(proc, GameManager.Update); hook.batch([(fn, a1, a2)]); hook.close()
+    Das Spiel muss dabei laufen (nicht minimiert/eingefroren), sonst gibt es eine Zeitüberschreitung.
+    """
+
+    def __init__(self, proc, hook_addr, attach=(0, 0, 0)):
+        if proc.is32:
+            raise RemoteError("Nur für 64-bit Spiele.")
+        import threading
+        self.lock = threading.Lock()
+        self.proc, self.addr, self.attach = proc, hook_addr, attach
+        self.rc = RemoteCaller(proc)
+        self.base = proc.alloc(0x1000, near=hook_addr)
+        if not self.base:
+            raise RemoteError("Kein Speicher in der Nähe der Funktion frei.")
+        orig = proc.read_bytes(hook_addr, 32)
+        if not orig:
+            raise RemoteError("Funktion nicht lesbar.")
+        relocated, n = _relocate(orig, hook_addr, self.base + H_STUB + 0x80)  # vorläufig, s. u.
+        stub, rel_at = _stub(self.base, b"\x90" * len(relocated), hook_addr + n)
+        relocated, n = _relocate(orig, hook_addr, self.base + H_STUB + rel_at)
+        stub, _ = _stub(self.base, relocated, hook_addr + n)
+        self.orig = orig[:n]
+        self.rc.write(self.base, _batch_code())
+        self.rc.write(self.base + H_STUB, stub)
+        self.rc.write(self.base + H_FLAG, b"\0" * 24)
+        jmp = b"\xE9" + struct.pack("<i", self.base + H_STUB - (hook_addr + 5)) + b"\x90" * (n - 5)
+        if not proc.write_bytes(hook_addr, jmp, code=True):
+            raise RemoteError("Einhängen fehlgeschlagen.")
+        self.hooked = True
+        _OPEN_HOOKS.add(self)
+
+    def batch(self, calls, timeout=5.0):
+        """Wie RemoteCaller.batch, aber im Hauptthread. Wartet, bis das Spiel die Funktion aufruft."""
+        with self.lock:
+            return self._batch(calls, timeout)
+
+    def _batch(self, calls, timeout):
+        import time
+        n = len(calls)
+        buf = bytearray(HEADER + n * ENTRY)
+        struct.pack_into("<QQQQ", buf, 0, *self.attach, n)
+        for i, c in enumerate(calls):
+            if not c[0]:
+                raise RemoteError("Funktion im Spiel nicht gefunden.")
+            args = list(c[1:]) + [0] * 4
+            struct.pack_into("<QQQQQQ", buf, HEADER + i * ENTRY, c[0], *[a & 0xFFFFFFFFFFFFFFFF for a in args[:4]], 0)
+        mem = self.rc.alloc(len(buf))
+        self.rc.write(mem, bytes(buf))
+        self.rc.write(self.base + H_REQ, struct.pack("<Q", mem))
+        self.rc.write(self.base + H_FLAG, struct.pack("<I", 1))
+        end = time.time() + timeout
+        while True:
+            flag = struct.unpack("<I", self.proc.read_bytes(self.base + H_FLAG, 4))[0]
+            if flag == 2:
+                break
+            if time.time() > end:
+                if flag == 1:  # Auftrag zurückziehen (Puffer bleibt reserviert, falls er gerade startet)
+                    self.rc.write(self.base + H_FLAG, struct.pack("<I", 0))
+                    raise RemoteError("Zeitüberschreitung: Das Spiel hat die Funktion nicht aufgerufen "
+                                          "(Spiel im Menü, pausiert oder minimiert?).")
+                end = time.time() + 30  # läuft schon: abwarten
+            time.sleep(0.005)
+        res = self.proc.read_bytes(mem, len(buf))
+        self.rc.write(self.base + H_FLAG, struct.pack("<I", 0))
+        self.rc.free(mem)
+        return [struct.unpack_from("<Q", res, HEADER + i * ENTRY + 0x28)[0] for i in range(n)]
+
+    def call(self, fn, *args, timeout=5.0):
+        return self.batch([(fn, *args)], timeout)[0]
+
+    def last_this(self):
+        """rcx beim letzten Durchlauf der eingehängten Funktion (0, wenn sie noch nicht lief)."""
+        return struct.unpack("<Q", self.proc.read_bytes(self.base + H_THIS, 8))[0]
+
+    def fires(self, timeout=1.0):
+        """True, wenn das Spiel die eingehängte Funktion gerade regelmäßig aufruft."""
+        import time
+        self.rc.write(self.base + H_THIS, b"\0" * 8)
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.last_this():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def close(self):
+        """Original wiederherstellen. Der Ausweichcode bleibt im Spiel (ein Thread könnte noch darin sein)."""
+        if getattr(self, "hooked", False):
+            self.proc.write_bytes(self.addr, self.orig, code=True)
+            self.hooked = False
+        _OPEN_HOOKS.discard(self)
+        self.rc.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()

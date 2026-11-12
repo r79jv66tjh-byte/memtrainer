@@ -12,9 +12,11 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import gui_actions as ga
 import gui_extra as gx
 import gui_tools as gt
 from scanner_core import (FIRST_MODES, HOTKEYS, MULTI, NEXT_MODES, TYPE_CHOICES, MultiScanner,
@@ -269,6 +271,10 @@ class App(tk.Tk):
         self.key_state = {}
         self.ticks = 0
         self.unity = None          # geladene Unity-Laufzeit (gui_extra.UnityWindow)
+        self.unity_loading = False
+        self.actions = []          # Aktionen (Spiel-Methoden per Knopf/Hotkey/Timer)
+        self.action_exec = ga.ActionExecutor(self)
+        self.action_sched = ga.ActionScheduler(self)
         self.row_sc = {}           # Treffer-iid -> (adresse, scanner)
         self.scan_keys = {}        # Zustand der Scan-Hotkeys
         self.pending_noise = 0     # Rauschfilter nach dem ersten Scan starten (Sekunden)
@@ -288,6 +294,7 @@ class App(tk.Tk):
         m.add_separator()
         m.add_command(label="Tabelle laden…", command=self.load_table)
         m.add_command(label="Tabelle speichern…", command=self.save_table)
+        m.add_command(label="Preset laden…", command=self.load_preset)
         m.add_command(label="Trainer exportieren…", command=lambda: ExportDialog(self))
         m.add_separator()
         m.add_command(label="Beenden", command=self.destroy)
@@ -300,6 +307,7 @@ class App(tk.Tk):
         w.add_separator()
         w.add_command(label="Such-Assistent", command=lambda: gx.AssistantWindow(self))
         w.add_command(label="Unity-Explorer (Werte per Name)", command=self.open_unity)
+        w.add_command(label="Aktionen & Timer (z. B. Kill-all)", command=self.open_actions)
         w.add_command(label="Struktur-Ansicht…", command=lambda: self.need_proc() and gx.StructWindow(self))
         w.add_command(label="Werteverlauf der Treffer", command=self.history_selected_or_all)
         mb.add_cascade(label="Werkzeuge", menu=w)
@@ -435,8 +443,11 @@ class App(tk.Tk):
         pid, name = proc.pid, proc.name
         if self.proc:
             self.proc.close()
+        if self.unity is not None:
+            self.unity.close_hook()
         self.proc, self.runner, self.speed = proc, CheatRunner(proc), None
         self.unity = None
+        self.unity_loading = False
         self.new_scan()
         bits = "32-bit" if proc.is32 else "64-bit"
         self.proc_lbl.config(text=f"Verbunden: {name} (PID {pid}, {bits})", foreground="#070")
@@ -446,6 +457,17 @@ class App(tk.Tk):
             else:
                 e["active"] = False
         self.render_all()
+        self.after(300, lambda: self.offer_preset(name))
+
+    def offer_preset(self, name):
+        path = self.find_preset(name)
+        if not path or self.entries or self.actions or not self.proc or self.proc.name != name:
+            if self.needs_unity():
+                self.ensure_unity()
+            return
+        if messagebox.askyesno("Preset", f"Für {name} gibt es ein fertiges Preset (Werte, Kill-all, Freischalten …).\n"
+                                         "Jetzt laden?", parent=self):
+            self.load_table(path)
 
     def ensure_speedhack(self, quiet=False):
         if self.speed:
@@ -643,6 +665,88 @@ class App(tk.Tk):
     def open_unity(self):
         if self.need_proc():
             gx.UnityWindow(self)
+
+    # ---------------- Unity im Hintergrund / Aktionen ----------------
+    def set_unity(self, rt):
+        if self.unity is not None and self.unity is not rt:
+            self.unity.close_hook()
+        self.unity = rt
+        if self.runner:
+            self.runner.unity = rt
+
+    def needs_unity(self):
+        return bool(self.actions) or any(str(e["expr"]).startswith("unity:") for e in self.entries.values())
+
+    def ensure_unity(self):
+        """Unity-Daten für Pfad-Einträge und Aktionen im Hintergrund laden."""
+        if not self.proc or self.unity is not None or self.unity_loading:
+            return
+        import unity
+        if not unity.detect(self.proc) or self.proc.is32:
+            return
+        self.unity_loading = True
+        proc = self.proc
+
+        def work():
+            try:
+                rt = unity.UnityRuntime(proc).load()
+            except Exception:  # noqa: BLE001 - z. B. Ladebildschirm: später erneut
+                rt = None
+            self.q.put(("u", (proc, rt)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_actions(self):
+        for w in self.winfo_children():
+            if isinstance(w, ga.ActionsWindow):
+                w.lift()
+                return w
+        self.ensure_unity()
+        return ga.ActionsWindow(self)
+
+    def run_action(self, action, confirm=False):
+        if not self.proc:
+            if confirm:
+                messagebox.showinfo("Aktion", "Erst einen Prozess wählen.", parent=self)
+            return
+        if self.unity is None:
+            self.ensure_unity()
+            action["_last"] = "Unity wird geladen – gleich nochmal versuchen"
+            return
+        if self.action_exec.submit(action):
+            action["_last"] = "läuft…"
+
+    def presets_dir(self):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(base, "presets")
+
+    def find_preset(self, proc_name):
+        d = self.presets_dir()
+        try:
+            names = os.listdir(d)
+        except OSError:
+            return None
+        for n in names:
+            if n.lower().endswith(".json"):
+                try:
+                    with open(os.path.join(d, n), encoding="utf-8") as f:
+                        if json.load(f).get("process", "").lower() == proc_name.lower():
+                            return os.path.join(d, n)
+                except (OSError, ValueError):
+                    continue
+        return None
+
+    def load_preset(self):
+        path = filedialog.askopenfilename(initialdir=self.presets_dir(), filetypes=[("Preset/Tabelle", "*.json")])
+        if path:
+            self.load_table(path)
+
+    def destroy(self):
+        if self.unity is not None:
+            try:
+                self.unity.close_hook()
+            except Exception:  # noqa: BLE001
+                pass
+        super().destroy()
 
     def watch(self, addr, size=4, access="w"):
         return gt.WatchWindow(self, addr, size, access)
@@ -928,12 +1032,12 @@ class App(tk.Tk):
         if not path:
             return
         proc = self.proc.name if self.proc else self.table_process
-        data = table_to_json(self.ordered_entries(), proc, speed=self.speed_cfg)
+        data = table_to_json(self.ordered_entries(), proc, speed=self.speed_cfg, actions=self.actions)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
-    def load_table(self):
-        path = filedialog.askopenfilename(filetypes=[("Tabelle", "*.json")])
+    def load_table(self, path=None):
+        path = path or filedialog.askopenfilename(filetypes=[("Tabelle", "*.json")])
         if not path:
             return
         try:
@@ -947,6 +1051,11 @@ class App(tk.Tk):
             if e["type"] == PATCH:
                 e["active"] = False
             self.add_entry(e)
+        self.actions.extend(t.get("actions", []))
+        if t.get("actions"):
+            self.open_actions().render()
+        if self.needs_unity():
+            self.ensure_unity()
 
     # ---------------- Hauptschleife ----------------
     def tick(self):
@@ -955,6 +1064,14 @@ class App(tk.Tk):
                 kind, val = self.q.get_nowait()
                 if kind == "p":
                     self.pb["value"] = val
+                elif kind == "u":
+                    proc, rt = val
+                    self.unity_loading = False
+                    if proc is self.proc and rt is not None and self.unity is None:
+                        self.set_unity(rt)
+                elif kind == "a":
+                    action, text, ok = val
+                    action["_last"] = time.strftime("%H:%M:%S ") + text
                 else:
                     self.scan_finished(*val)
         except queue.Empty:
@@ -970,6 +1087,9 @@ class App(tk.Tk):
                         self.render_entry(iid)
                     self.key_state[(iid, k)] = down
             self.runner.tick(self.entries.values())
+            self.action_sched.tick(self.actions)
+            if self.ticks % 40 == 0 and self.unity is None and self.needs_unity():
+                self.ensure_unity()
             if self.hotkeys_on.get():
                 self.scan_hotkeys()
             if self.ticks % 5 == 0 and not self.worker and len(self.row_sc) <= 200:

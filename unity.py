@@ -135,6 +135,8 @@ class UnityRuntime:
         self.domain = 0
         self.images = []
         self.loaded_all = False
+        import threading
+        self.lock = threading.RLock()  # Hook/Wurzel-Objekte aus GUI- und Aktions-Thread
 
     # -- Hilfen ---------------------------------------------------------------
     def fn(self, name, required=True):
@@ -409,6 +411,354 @@ class UnityRuntime:
         scored.sort()
         return [a for _, a in scored[:limit]]
 
+    # -- Methoden aufrufen (nur IL2CPP) ------------------------------------------------
+    def methods(self, cls):
+        """Methoden der Klasse (ohne geerbte) mit Parametern. Zwischengespeichert."""
+        if self.kind != "il2cpp":
+            raise UnityError("Methoden aufrufen geht bisher nur bei IL2CPP-Spielen.")
+        cache = self.__dict__.setdefault("_methods", {})
+        if cls.ptr in cache:
+            return cache[cls.ptr]
+        out = []
+        with self._caller() as rc:
+            it = rc.alloc(8)
+            rc.write(it, b"\0" * 8)
+            ms = []
+            while len(ms) < 5000:
+                m = rc.call(self.fn("class_get_methods"), cls.ptr, it)
+                if not m:
+                    break
+                ms.append(m)
+            rc.free(it)
+            info = rc.batch([c for m in ms for c in ((self.fn("method_get_name"), m),
+                                                     (self.fn("method_get_param_count"), m),
+                                                     (self.fn("method_get_flags"), m, 0),
+                                                     (self.fn("method_get_return_type"), m))])
+            strs = _Strings(self.proc)
+            pcalls, owners = [], []
+            for i, m in enumerate(ms):
+                raw = self.proc.read_bytes(m, 8)
+                fn = struct.unpack("<Q", raw)[0] if raw else 0
+                meth = Method(m, strs.get(info[4 * i]), fn, bool(info[4 * i + 2] & 0x10), cls)
+                out.append(meth)
+                for j in range(min(info[4 * i + 1] & 0xFF, 16)):
+                    pcalls += [(self.fn("method_get_param"), m, j), (self.fn("method_get_param_name"), m, j)]
+                    owners.append(meth)
+            pres = rc.batch(pcalls) if pcalls else []
+            types = [pres[2 * k] for k in range(len(owners))] + [info[4 * i + 3] for i in range(len(ms))]
+            tres = rc.batch([(self.fn("type_get_type"), t) for t in types] +
+                            [(self.fn("type_get_name"), t) for t in types]) if types else []
+            nt = len(types)
+            vt = [k for k in range(len(owners)) if tres[k] & 0xFF == 0x11]  # Werttypen: Enum?
+            vcls = rc.batch([(self.fn("class_from_type"), pres[2 * k]) for k in vt]) if vt else []
+            venum = rc.batch([(self.fn("class_is_enum"), c) for c in vcls]) if vt else []
+            enum_of = {k: c for k, c, e in zip(vt, vcls, venum) if c and e & 0xFF}
+            for k, meth in enumerate(owners):
+                tn = (strs.get(tres[nt + k]) or "?").split(".")[-1]
+                meth.params.append((strs.get(pres[2 * k + 1]) or f"p{len(meth.params)}", tres[k] & 0xFF, tn,
+                                    enum_of.get(k, 0)))
+            for i, meth in enumerate(out):
+                meth.ret = (strs.get(tres[nt + len(owners) + i]) or "?").split(".")[-1]
+        cache[cls.ptr] = out
+        return out
+
+    def find_method(self, cls, name, nparams=None):
+        """Methode per Name in der Klasse oder ihren Basisklassen."""
+        k = cls
+        while k is not None:
+            for m in self.methods(k):
+                if m.name == name and (nparams is None or len(m.params) == nparams):
+                    return m
+            k = self.by_ptr.get(k.parent)
+        return None
+
+    def _frame_candidates(self, cls=None):
+        """Methoden, die vermutlich jedes Bild im Hauptthread laufen (Update…), beste zuerst."""
+        own = []
+        k = cls
+        while k is not None:
+            own += [m for name in FRAME_METHODS for m in self.methods(k) if m.name == name and not m.params]
+            k = self.by_ptr.get(k.parent)
+        rest = []
+        for c in sorted(self.classes, key=lambda c: next((i for i, w in enumerate(HOOK_PREFER)
+                                                           if w in c.name.lower()), 99)):
+            if not any(w in c.name.lower() for w in HOOK_PREFER) or _is_ui(c):
+                continue
+            rest += [m for m in self.methods(c) if m.name in ("Update", "LateUpdate") and not m.params]
+            if len(rest) > 40:
+                break
+        return own, rest
+
+    def main_hook(self, cls=None, timeout=1.0, progress=lambda t: None):
+        with self.lock:
+            return self._main_hook_impl(cls=cls, timeout=timeout, progress=progress)
+
+    def _main_hook_impl(self, cls=None, timeout=1.0, progress=lambda t: None):
+        """Hauptthread-Einhängung, wiederverwendet solange sie feuert. Bevorzugt cls.Update (liefert 'this')."""
+        from remote import MainThreadHook
+        h = self.__dict__.get("_hook")
+        if h is not None and h.hooked and (cls is None or getattr(h, "cls", None) is cls) and h.fires(0.5):
+            return h
+        self.close_hook()
+        own, rest = self._frame_candidates(cls)
+        seen = set()
+        for m in own + rest:
+            if not m.fn or m.fn in seen:
+                continue
+            seen.add(m.fn)
+            progress(f"Einhängen in {m.cls.name}.{m.name}…")
+            try:
+                h = MainThreadHook(self.proc, m.fn)
+            except RemoteError:
+                continue
+            if h.fires(timeout):
+                h.cls = cls if m in own else None
+                h.method = m
+                self._hook = h
+                return h
+            h.close()
+        raise UnityError("Keine Funktion gefunden, die das Spiel gerade jedes Bild aufruft "
+                         "(läuft das Spiel und ist es nicht im Ladebildschirm?).")
+
+    def close_hook(self):
+        h = self.__dict__.pop("_hook", None)
+        if h is not None:
+            h.close()
+
+    def live_instance(self, cls, samples=20):
+        """Das Objekt, dessen Update() gerade läuft (nicht alte Kopien). None, wenn cls kein Update hat."""
+        h = self.main_hook(cls)
+        if getattr(h, "cls", None) is None:
+            return None
+        valid = {c.ptr for c in self.subclasses(cls)}
+        seen = {}
+        for _ in range(samples):
+            t = h.last_this()
+            if t and self.proc.read_ptr(t) in valid:
+                seen[t] = seen.get(t, 0) + 1
+            time.sleep(0.01)
+        return max(seen, key=seen.get) if seen else None
+
+    def invoke(self, method, obj=None, args=(), timeout=5.0):
+        """Methode im Hauptthread des Spiels aufrufen. obj=None: lebendes Objekt automatisch finden.
+        Ein Enum-Argument '*' ruft die Methode für jeden Enum-Wert auf.
+        Liefert (Liste der Rückgabe-rax, verwendetes Objekt)."""
+        if not method.callable:
+            raise UnityError("Diese Methode hat zu viele oder nicht unterstützte Parameter (z. B. Vector3).")
+        if len(args) != len(method.params):
+            raise UnityError(f"{method.name} erwartet {len(method.params)} Argument(e).")
+        if not method.static and not obj:
+            obj = self.live_instance(method.cls)
+            if not obj:
+                raise UnityError(f"Kein laufendes {method.cls.name}-Objekt gefunden – bitte Objekt angeben.")
+        sets = [[]]
+        with self._caller() as rc:
+            for p, a in zip(method.params, args):
+                a = str(a).strip()
+                if a == "*" and p[3]:
+                    vals = [v for n, v in self.enum_values(p[3]).items() if not _skip_enum(n)]
+                    sets = [s + [v & 0xFFFFFFFFFFFFFFFF] for s in sets for v in vals]
+                elif a.startswith("keys:"):  # Schlüssel eines Dictionary aus den Spieldaten
+                    path = a[5:].strip()
+                    if "::" not in path:
+                        path = f"{self._call_root}::{path}"
+                    names = {v: n for n, v in self.enum_values(p[3]).items()} if p[3] else {}
+                    vals = [v for v in self.dict_keys(path)
+                            if not _skip_enum(names.get(v, ""))]
+                    sets = [s + [v & 0xFFFFFFFFFFFFFFFF] for s in sets for v in vals]
+                else:
+                    v = _call_arg(self, p, a, rc)
+                    sets = [s + [v] for s in sets]
+        h = self.main_hook(None)
+        calls = [(method.fn, *([] if method.static else [obj]), *regs, method.ptr) for regs in sets]
+        return h.batch(calls, timeout=timeout), obj
+
+    def dict_keys(self, path):
+        """Schlüssel (als Ganzzahl, z. B. Enum) eines Dictionary<int-artig, …> am Pfad."""
+        addr, _ = self.resolve_path(path)
+        d = self.proc.read_ptr(addr) if addr else 0
+        if not d:
+            raise UnityError(f"{path} ist leer.")
+        kp = self.proc.read_ptr(d)
+        ent_f, cnt_f = self._field_of(kp, "_entries") or self._field_of(kp, "entries"), \
+            self._field_of(kp, "_count") or self._field_of(kp, "count")
+        if ent_f is None or cnt_f is None:
+            raise UnityError(f"{path} ist kein Dictionary.")
+        arr = self.proc.read_ptr(d + ent_f.offset)
+        count = self.proc.read_value(d + cnt_f.offset, np.int32) or 0
+        if not arr or count <= 0:
+            return []
+        with self._caller() as rc:
+            elem = rc.call(self.fn("class_get_element_class"), self.proc.read_ptr(arr))
+            esize = rc.call(self.fn("class_value_size"), elem, 0) & 0xFFFFFFFF if elem else 0
+        if not 12 <= esize <= 64:
+            raise UnityError("Unbekanntes Dictionary-Format.")
+        raw = self.proc.read_bytes(arr + 0x20, esize * count) or b""
+        keys = []
+        for i in range(len(raw) // esize):
+            h, _, key = struct.unpack_from("<iii", raw, i * esize)
+            if h >= 0:  # freie Einträge haben hashCode -1
+                keys.append(key)
+        return keys
+
+    def enum_values(self, enum_cls):
+        """Name -> Wert aller Konstanten einer Enum-Klasse (Zeiger)."""
+        cache = self.__dict__.setdefault("_enums", {})
+        if enum_cls in cache:
+            return cache[enum_cls]
+        out = {}
+        with self._caller() as rc:
+            it = rc.alloc(8)
+            rc.write(it, b"\0" * 8)
+            fs = []
+            while len(fs) < 20000:
+                f = rc.call(self.fn("class_get_fields"), enum_cls, it)
+                if not f:
+                    break
+                fs.append(f)
+            info = rc.batch([c for f in fs for c in ((self.fn("field_get_name"), f),
+                                                     (self.fn("field_get_flags"), f))])
+            lits = [(k, f) for k, f in enumerate(fs) if info[2 * k + 1] & FIELD_LITERAL]
+            buf = rc.alloc(8 * max(len(lits), 1))
+            rc.write(buf, b"\0" * 8 * max(len(lits), 1))
+            rc.batch([(self.fn("field_static_get_value"), f, buf + 8 * n) for n, (_, f) in enumerate(lits)])
+            raw = self.proc.read_bytes(buf, 8 * max(len(lits), 1)) or b""
+            strs = _Strings(self.proc)
+            for n, (k, _) in enumerate(lits):
+                v = struct.unpack_from("<q", raw, 8 * n)[0]
+                v = v - (1 << 32) if v & 0x80000000 and not v >> 32 else v  # int32-Enums
+                out[strs.get(info[2 * k])] = v
+            rc.free(it)
+            rc.free(buf)
+        cache[enum_cls] = out
+        return out
+
+    # -- Pfade (überstehen Neustarts) ---------------------------------------------------
+    def class_by_name(self, name):
+        cs = self.find_class(name)
+        if not cs:
+            raise UnityError(f"Klasse {name} nicht gefunden.")
+        return cs[0]
+
+    def _field_of(self, klass_ptr, name):
+        cache = self.__dict__.setdefault("_fcache", {})
+        key = (klass_ptr, name)
+        if key not in cache:
+            c = self.by_ptr.get(klass_ptr) or (self._load_single(klass_ptr) if klass_ptr else None)
+            f = None
+            while c is not None and f is None:
+                f = next((x for x in c.fields if x.name == name or x.name == f"<{name}>k__BackingField"), None)
+                c = self.by_ptr.get(c.parent) or (self._load_single(c.parent) if c.parent else None)
+            cache[key] = f
+        return cache[key]
+
+    def root(self, cls, refresh=False):
+        with self.lock:
+            return self._root_impl(cls=cls, refresh=refresh)
+
+    def _root_impl(self, cls, refresh=False):
+        """Lebendes Objekt der Klasse (zwischengespeichert, wird geprüft)."""
+        roots = self.__dict__.setdefault("_roots", {})
+        valid = {c.ptr for c in self.subclasses(cls)}
+        obj = roots.get(cls.ptr)
+        if obj and not refresh and self.proc.read_ptr(obj) in valid:
+            return obj
+        last = self.__dict__.setdefault("_root_try", {})
+        if time.time() - last.get(cls.ptr, 0) < 3 and not refresh:
+            return None  # nicht dauernd neu suchen (Ladebildschirm)
+        last[cls.ptr] = time.time()
+        try:
+            obj = self.live_instance(cls)
+        except (UnityError, RemoteError):
+            obj = None
+        if not obj:
+            found = self.instances(cls, limit=2)
+            obj = found[0] if len(found) == 1 else None
+        roots[cls.ptr] = obj
+        return obj
+
+    def resolve_path(self, path):
+        """'GameManager::_mainCharacters[0]._currentHp' -> (Adresse, Field) oder (None, None)."""
+        cname, _, rest = path.partition("::")
+        cls = self.class_by_name(cname.strip())
+        steps = re.findall(r"[^.\[\]]+|\[\d+\]", rest)
+        if not steps:
+            raise UnityError("Pfad ohne Feld.")
+        first = self._field_of(cls.ptr, steps[0])
+        if first is None:
+            raise UnityError(f"Feld {steps[0]} gibt es in {cls.name} nicht.")
+        if first.static:
+            base = self.__dict__.setdefault("_sbase", {}).get(cls.ptr) or self.static_base(cls)
+            self._sbase[cls.ptr] = base
+            addr, field = (base + first.offset if base else None), first
+        else:
+            obj = self.root(cls)
+            addr, field = (obj + first.offset if obj else None), first
+        rp = self.proc.read_ptr
+        for st in steps[1:]:
+            if addr is None:
+                return None, None
+            obj = rp(addr)
+            if not obj:
+                return None, None
+            if st.startswith("["):
+                i = int(st[1:-1])
+                kp = rp(obj)
+                k = self.by_ptr.get(kp) or (self._load_single(kp) if kp else None)
+                if k is not None and k.name.startswith("List`"):  # List<T>: _items, _size
+                    size = self.proc.read_value(obj + 0x18, np.int32)
+                    if size is None or i >= size:
+                        return None, None
+                    obj = rp(obj + 0x10)
+                addr, field = obj + 0x20 + 8 * i, None  # Array: Daten ab +0x20
+                continue
+            f = self._field_of(rp(obj), st)
+            if f is None:
+                return None, None
+            addr, field = obj + f.offset, f
+        return addr, field
+
+    def run_call(self, text, timeout=5.0):
+        """Ein oder mehrere Aufrufe (mit ';' getrennt). Liefert die Rückgabewerte aller Aufrufe."""
+        out = []
+        with self.lock:
+            for part in [x for x in text.split(";") if x.strip()]:
+                out += self._run_call_impl(text=part, timeout=timeout)
+        return out
+
+    def _run_call_impl(self, text, timeout=5.0):
+        """'GameManager::RosaryDamage(true, 1.8)' oder 'GameManager::_playerOptions.UnlockStage(*)'
+        im Hauptthread ausführen. Liefert die Liste der Rückgabewerte (rax)."""
+        m = re.fullmatch(r"\s*(.+?)::(?:(.+)\.)?(\w+)\s*\((.*)\)\s*", text)
+        if not m:
+            raise UnityError("Aufruf bitte als Klasse::Methode(arg1, arg2) oder Klasse::feld.Methode(…).")
+        cls = self.class_by_name(m.group(1).strip())
+        self._call_root = m.group(1).strip()  # für relative 'keys:'-Pfade
+        args = [a.strip() for a in m.group(4).split(",")] if m.group(4).strip() else []
+        if m.group(2):  # Pfad zum Objekt
+            addr, _ = self.resolve_path(f"{m.group(1).strip()}::{m.group(2)}")
+            obj = self.proc.read_ptr(addr) if addr else 0
+            if not obj:
+                raise UnityError(f"{m.group(2)} ist gerade leer (Spiel im Menü?).")
+            kp = self.proc.read_ptr(obj)
+            cls = self.by_ptr.get(kp) or self._load_single(kp)
+        else:
+            obj = None
+        cands = []
+        k = cls
+        while k is not None:
+            cands += [x for x in self.methods(k) if x.name == m.group(3) and len(x.params) == len(args)]
+            k = self.by_ptr.get(k.parent)
+        meth = next((x for x in cands if x.callable and all(
+            (p[3] or (a != "*" and not a.startswith("keys:"))) for p, a in zip(x.params, args))), None)
+        if meth is None:
+            raise UnityError(f"{cls.name}.{m.group(3)} mit {len(args)} passenden Argument(en) nicht gefunden.")
+        if obj is None and not meth.static:
+            obj = self.root(cls)
+            if not obj:
+                raise UnityError(f"Kein laufendes {cls.name}-Objekt (Spiel im Menü?).")
+        return self.invoke(meth, obj, args, timeout)[0]
+
     def _plausible(self, obj, cls, known):
         """Punkte für ein mögliches Objekt; < 0 = sicher kein echtes Objekt."""
         data = self.proc.read_bytes(obj, 0x10)
@@ -497,7 +847,60 @@ class UnityRuntime:
         return "null" if not p else f"→ {p:X}"
 
 
-_UI_HINTS = ("ui", "page", "popup", "button", "text", "vfx", "fx", "tween", "anim", "icon", "panel",
+class Method:
+    __slots__ = ("ptr", "name", "fn", "static", "cls", "params", "ret")
+
+    def __init__(self, ptr, name, fn, static, cls):
+        self.ptr, self.name, self.fn, self.static, self.cls = ptr, name, fn, static, cls
+        self.params = []  # (Name, Typ-Enum, Typname, Enum-Klasse oder 0)
+        self.ret = "?"
+
+    @property
+    def signature(self):
+        ps = ", ".join(f"{p[2]} {p[0]}" for p in self.params)
+        return f"{'static ' if self.static else ''}{self.ret} {self.name}({ps})"
+
+    @property
+    def callable(self):
+        """Nur Register-Argumente (Win64: 4) – inkl. Objekt und versteckter MethodInfo."""
+        n = len(self.params) + (0 if self.static else 1) + 1
+        return bool(self.fn) and n <= 4 and all(p[1] in CALL_TYPES or p[3] for p in self.params)
+
+
+ENUM_SKIP = {"NONE", "VOID", "COUNT", "MAX", "ALL", "DEFAULT", "UNDEFINED", "INVALID"}
+
+
+def _skip_enum(name):
+    """Platzhalter- und Test-Einträge nicht freischalten (können Menüs/Spielstände beschädigen)."""
+    u = name.upper()
+    return u in ENUM_SKIP or "TEST" in u or "DEBUG" in u or u.startswith("DUMMY")
+CALL_TYPES = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0x12, 0x18, 0x19, 0x1C}
+FRAME_METHODS = ("Update", "LateUpdate", "OnUpdate", "FixedUpdate", "Tick", "OnTick")
+HOOK_PREFER = ("gamemanager", "manager", "game", "player", "controller")
+
+
+def _call_arg(rt, param, text, rc):
+    """Text -> 64-bit Registerwert für einen Parameter."""
+    tenum, enum_cls = param[1], param[3]
+    text = str(text).strip()
+    if enum_cls:
+        vals = rt.enum_values(enum_cls)
+        hit = next((v for n, v in vals.items() if n.lower() == text.lower()), None)
+        return (hit if hit is not None else int(text, 0)) & 0xFFFFFFFFFFFFFFFF
+    if tenum == 2:
+        return 1 if text.lower() in ("1", "true", "ja", "wahr", "yes") else 0
+    if tenum == 12:
+        return struct.unpack("<I", struct.pack("<f", float(text.replace(",", "."))))[0]
+    if tenum == 13:
+        return struct.unpack("<Q", struct.pack("<d", float(text.replace(",", "."))))[0]
+    if tenum == 14:
+        return rc.call(rt.fn("string_new"), rc.cstring(text))
+    if tenum in (0x12, 0x1C):
+        return int(text, 16) if text not in ("", "0", "null") else 0
+    return int(text, 0) & 0xFFFFFFFFFFFFFFFF
+
+
+_UI_HINTS = ("ui","page", "popup", "button", "text", "vfx", "fx", "tween", "anim", "icon", "panel",
              "widget", "view", "menu", "tooltip", "label", "sfx", "shader", "renderer")
 
 

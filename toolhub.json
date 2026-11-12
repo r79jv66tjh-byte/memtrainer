@@ -406,7 +406,7 @@
           "flag": "--expr",
           "type": "string",
           "required": true,
-          "description": "Adresse/Ausdruck"
+          "description": "Adresse/Ausdruck – auch Unity-Pfad 'unity:GameManager::_mainCharacters[0]._currentHp' (übersteht Neustarts)"
         },
         {
           "name": "type",
@@ -439,7 +439,7 @@
           "flag": "--expr",
           "type": "string",
           "required": true,
-          "description": "Adresse/Ausdruck"
+          "description": "Adresse/Ausdruck – auch Unity-Pfad 'unity:GameManager::_mainCharacters[0]._currentHp' (übersteht Neustarts)"
         },
         {
           "name": "type",
@@ -575,6 +575,79 @@
         }
       ],
       "readonly": true
+    },
+    {
+      "name": "unity-methods",
+      "description": "Unity (IL2CPP): Methoden einer Klasse mit Parametern auflisten (z. B. class='GameManager', query='rosary'). 'callable' = per unity-call aufrufbar.",
+      "run": [
+        "python",
+        "cli.py",
+        "unity-methods"
+      ],
+      "args": [
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID des Spiels"
+        },
+        {
+          "name": "class",
+          "flag": "--class",
+          "type": "string",
+          "required": true,
+          "description": "Klassenname (mit oder ohne Namespace)"
+        },
+        {
+          "name": "query",
+          "flag": "--query",
+          "type": "string",
+          "required": false,
+          "description": "Filter auf den Methodennamen"
+        },
+        {
+          "name": "inherited",
+          "flag": "--inherited",
+          "type": "boolean",
+          "required": false,
+          "description": "Auch geerbte Methoden"
+        }
+      ],
+      "readonly": true
+    },
+    {
+      "name": "unity-call",
+      "description": "Unity (IL2CPP): Spiel-Methode im Hauptthread aufrufen, z. B. 'GameManager::RosaryDamage(true, 1.8)' (Kill-all in Warhammer Survivors). Mehrere mit ';'. Objekt per Pfad: 'GameManager::_playerOptions.Save(true, true)'. Enum '*' = alle Werte, 'keys:feld.dict' = Schlüssel eines Dictionary. Kann den Spielstand dauerhaft ändern.",
+      "run": [
+        "python",
+        "cli.py",
+        "unity-call"
+      ],
+      "args": [
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID des Spiels"
+        },
+        {
+          "name": "call",
+          "flag": "--call",
+          "type": "string",
+          "required": true,
+          "description": "Aufruf Klasse::Methode(args)"
+        },
+        {
+          "name": "dry_run",
+          "flag": "--dry-run",
+          "type": "boolean",
+          "required": false,
+          "description": "Nur beschreiben, nicht aufrufen"
+        }
+      ],
+      "readonly": false
     }
   ]
 }
