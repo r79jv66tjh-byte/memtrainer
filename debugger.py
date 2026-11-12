@@ -9,6 +9,7 @@ import ctypes
 import ctypes.wintypes as wt
 import struct
 import threading
+import time
 
 from scanner_core import k32, _sig
 
@@ -22,11 +23,18 @@ THREAD_ACCESS = 0x0002 | 0x0008 | 0x0010 | 0x0040  # suspend/resume, get/set con
 TH32CS_SNAPTHREAD = 0x4
 
 # x64 CONTEXT (1232 Bytes, 16-Byte-ausgerichtet)
-CTX64_SIZE, CTX64_FLAGS = 1232, 0x100011  # CONTROL | DEBUG_REGISTERS
-CTX64 = {"flags": 48, "dr0": 72, "dr6": 104, "dr7": 112, "ip": 248}
+CTX64_SIZE, CTX64_FLAGS = 1232, 0x100013  # CONTROL | INTEGER | DEBUG_REGISTERS
+CTX64 = {"flags": 48, "dr0": 72, "dr6": 104, "dr7": 112, "ip": 248, "eflags": 0x44,
+         "rax": 0x78, "rcx": 0x80, "rdx": 0x88, "rbx": 0x90, "rsp": 0x98, "rbp": 0xA0, "rsi": 0xA8,
+         "rdi": 0xB0, "r8": 0xB8, "r9": 0xC0, "r10": 0xC8, "r11": 0xD0, "r12": 0xD8, "r13": 0xE0,
+         "r14": 0xE8, "r15": 0xF0}
 # WOW64_CONTEXT (32-bit Spiele)
-CTX32_SIZE, CTX32_FLAGS = 716, 0x10011
-CTX32 = {"flags": 0, "dr0": 4, "dr6": 20, "dr7": 24, "ip": 184}
+CTX32_SIZE, CTX32_FLAGS = 716, 0x10013
+CTX32 = {"flags": 0, "dr0": 4, "dr6": 20, "dr7": 24, "ip": 184, "eflags": 0xC0,
+         "edi": 0x9C, "esi": 0xA0, "ebx": 0xA4, "edx": 0xA8, "ecx": 0xAC, "eax": 0xB0, "ebp": 0xB4,
+         "esp": 0xC4}
+DWORD_KEYS = {"flags", "eflags"}
+RESUME_FLAG = 0x10000
 
 
 class EXCEPTION_RECORD(ctypes.Structure):
@@ -111,18 +119,34 @@ class _Ctx:
         fn = k32.Wow64SetThreadContext if self.is32 else k32.SetThreadContext
         return bool(fn(th, self.addr))
 
-    def _fmt(self):
-        return "<I" if self.is32 else "<Q"
+    def _fmt(self, k):
+        return "<I" if self.is32 or k in DWORD_KEYS else "<Q"
 
     def __getitem__(self, k):
-        return struct.unpack_from(self._fmt(), self.buf, self.off[k])[0]
+        return struct.unpack_from(self._fmt(k), self.buf, self.off[k])[0]
 
     def __setitem__(self, k, v):
-        struct.pack_into(self._fmt(), self.buf, self.off[k], v)
+        struct.pack_into(self._fmt(k), self.buf, self.off[k], v)
+
+    def reg(self, name):
+        """Registerwert per Name (rax, r8d -> r8, eax -> rax bei 64-bit …); None, wenn unbekannt."""
+        name = name.lower()
+        if name in self.off and name not in ("flags", "dr0", "dr6", "dr7"):
+            return self[name]
+        if not self.is32:
+            alias = {"e" + n[1:]: n for n in ("rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi")}
+            if name in alias:
+                return self[alias[name]] & 0xFFFFFFFF
+            if name.startswith("r") and name[-1] in "dwb" and name[1:-1].isdigit():
+                mask = {"d": 0xFFFFFFFF, "w": 0xFFFF, "b": 0xFF}[name[-1]]
+                return self[name[:-1]] & mask
+        return None
 
 
 def _dr7(size, access):
-    """access: 'w' = schreiben, 'rw' = lesen/schreiben."""
+    """access: 'w' = schreiben, 'rw' = lesen/schreiben, 'x' = ausführen."""
+    if access == "x":
+        return 1
     rw = 0b01 if access == "w" else 0b11
     ln = {1: 0b00, 2: 0b01, 4: 0b11, 8: 0b10}[size]
     return 1 | (rw << 16) | (ln << 18)
@@ -132,7 +156,7 @@ class AccessWatcher:
     """Startet einen Debug-Thread. hits: Counter {Instruktions-Endadresse: Anzahl}."""
 
     def __init__(self, proc, addr, size=4, access="w"):
-        if size not in (1, 2, 4, 8) or addr % size:
+        if access == "x" or size not in (1, 2, 4, 8) or addr % size:
             size = 1
         self.proc, self.addr, self.size, self.access = proc, addr, size, access
         self.hits = collections.Counter()
@@ -173,52 +197,82 @@ class AccessWatcher:
             return
         k32.DebugSetProcessKillOnExit(False)
         ev = DEBUG_EVENT()
-        seen_bp = set()
+        self._seen_bp = set()
         exited = False
         try:
             while not self._stop.is_set():
                 if not k32.WaitForDebugEvent(ctypes.byref(ev), 100):
                     continue
-                code, status = ev.dwDebugEventCode, DBG_CONTINUE
-                if code == CREATE_PROCESS_DEBUG_EVENT:
-                    info = ev.u.CreateProcessInfo
-                    if info.hFile:
-                        k32.CloseHandle(info.hFile)
-                    self._threads[ev.dwThreadId] = info.hThread
-                    self._apply(info.hThread, True)
-                elif code == CREATE_THREAD_DEBUG_EVENT:
-                    self._threads[ev.dwThreadId] = ev.u.CreateThread.hThread
-                    self._apply(ev.u.CreateThread.hThread, True)
-                elif code == EXIT_THREAD_DEBUG_EVENT:
-                    self._threads.pop(ev.dwThreadId, None)
-                elif code == LOAD_DLL_DEBUG_EVENT:
-                    if ev.u.LoadDll.hFile:
-                        k32.CloseHandle(ev.u.LoadDll.hFile)
-                elif code == EXIT_PROCESS_DEBUG_EVENT:
+                if self._dispatch(ev, draining=False):
                     exited = True
-                    k32.ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE)
                     break
-                elif code == EXCEPTION_DEBUG_EVENT:
-                    exc = ev.u.Exception.ExceptionRecord.ExceptionCode
-                    if exc in (EXC_SINGLE_STEP, WX86_SINGLE_STEP):
-                        th = self._threads.get(ev.dwThreadId)
-                        ctx = _Ctx(self.proc.is32)
-                        if th and ctx.get(th) and ctx["dr6"] & 1:
-                            self.hits[ctx["ip"]] += 1
-                            ctx["dr6"] = 0
-                            ctx.set(th)
-                        else:
-                            status = DBG_EXCEPTION_NOT_HANDLED
-                    elif exc in (EXC_BREAKPOINT, WX86_BREAKPOINT) and exc not in seen_bp:
-                        seen_bp.add(exc)  # Anhalte-Breakpoint beim Anhaengen (WoW64: zwei)
-                    else:
-                        status = DBG_EXCEPTION_NOT_HANDLED
-                k32.ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, status)
         finally:
             if not exited:
                 self._cleanup()
-                k32.DebugActiveProcessStop(pid)
+                exited = self._drain(ev)
+                if not exited:
+                    k32.DebugActiveProcessStop(pid)
             self.running = False
+
+    def _drain(self, ev, quiet_ms=150, max_s=3.0):
+        """Noch anstehende Ereignisse abarbeiten, bevor sich der Debugger löst. Sonst reicht Windows einen
+        bereits ausgelösten Breakpoint beim Lösen als unbehandelte Ausnahme weiter -> Spiel stürzt ab."""
+        end = time.time() + max_s
+        while time.time() < end:
+            if not k32.WaitForDebugEvent(ctypes.byref(ev), quiet_ms):
+                return False
+            if self._dispatch(ev, draining=True):
+                return True
+        return False
+
+    def _dispatch(self, ev, draining):
+        """Ein Debug-Ereignis behandeln und fortsetzen. True, wenn der Prozess beendet wurde."""
+        code, status = ev.dwDebugEventCode, DBG_CONTINUE
+        if code == CREATE_PROCESS_DEBUG_EVENT:
+            info = ev.u.CreateProcessInfo
+            if info.hFile:
+                k32.CloseHandle(info.hFile)
+            self._threads[ev.dwThreadId] = info.hThread
+            if not draining:
+                self._apply(info.hThread, True)
+        elif code == CREATE_THREAD_DEBUG_EVENT:
+            self._threads[ev.dwThreadId] = ev.u.CreateThread.hThread
+            if not draining:
+                self._apply(ev.u.CreateThread.hThread, True)
+        elif code == EXIT_THREAD_DEBUG_EVENT:
+            self._threads.pop(ev.dwThreadId, None)
+        elif code == LOAD_DLL_DEBUG_EVENT:
+            if ev.u.LoadDll.hFile:
+                k32.CloseHandle(ev.u.LoadDll.hFile)
+        elif code == EXIT_PROCESS_DEBUG_EVENT:
+            k32.ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE)
+            return True
+        elif code == EXCEPTION_DEBUG_EVENT:
+            exc = ev.u.Exception.ExceptionRecord.ExceptionCode
+            if exc in (EXC_SINGLE_STEP, WX86_SINGLE_STEP):
+                th = self._threads.get(ev.dwThreadId)
+                ctx = _Ctx(self.proc.is32)
+                ok = bool(th) and ctx.get(th)
+                if ok and (ctx["dr6"] & 1 or draining):
+                    if ctx["dr6"] & 1 and not draining:
+                        self._on_hit(ctx)
+                    ctx["dr6"] = 0
+                    if self.access == "x":  # Befehl beim Fortsetzen nicht erneut anhalten
+                        ctx["eflags"] = ctx["eflags"] | RESUME_FLAG
+                    if draining:
+                        ctx["dr7"] = ctx["dr7"] & ~0xF0003
+                    ctx.set(th)
+                elif not draining:
+                    status = DBG_EXCEPTION_NOT_HANDLED
+            elif exc in (EXC_BREAKPOINT, WX86_BREAKPOINT) and exc not in self._seen_bp:
+                self._seen_bp.add(exc)  # Anhalte-Breakpoint beim Anhaengen (WoW64: zwei)
+            else:
+                status = DBG_EXCEPTION_NOT_HANDLED
+        k32.ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, status)
+        return False
+
+    def _on_hit(self, ctx):
+        self.hits[ctx["ip"]] += 1
 
     def _cleanup(self):
         """Debug-Register in allen Threads zuruecksetzen."""
@@ -267,3 +321,57 @@ def find_instruction(proc, end_addr):
         return None
     (start, size, text), _ = votes.most_common(1)[0]
     return start, size, proc.read_bytes(start, size), text
+
+
+class InstructionTracer(AccessWatcher):
+    """'Welche Adressen nutzt dieser Befehl?': Ausführungs-Breakpoint auf einen Befehl; bei jedem
+    Durchlauf wird die Speicheradresse des Operanden aus den Registern berechnet.
+    addresses: Counter {Adresse: Anzahl}."""
+
+    def __init__(self, proc, ins_addr):
+        super().__init__(proc, ins_addr, 1, "x")
+        self.addresses = collections.Counter()
+        self.mem = None   # (basis, index, scale, disp, Größe) des Speicheroperanden
+        self.text = ""
+        self.op_size = 4
+        try:
+            import capstone
+        except ImportError:
+            self.error = "capstone fehlt (pip install capstone)."
+            return
+        data = proc.read_bytes(ins_addr, 16)
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32 if proc.is32 else capstone.CS_MODE_64)
+        md.detail = True
+        ins = next(md.disasm(data or b"", ins_addr), None)
+        if ins is None:
+            self.error = "Befehl nicht lesbar."
+            return
+        self.text = f"{ins.mnemonic} {ins.op_str}"
+        from capstone import x86
+        for op in ins.operands:
+            if op.type == x86.X86_OP_MEM:
+                m = op.mem
+                self.mem = (ins.reg_name(m.base) if m.base else None, ins.reg_name(m.index) if m.index else None,
+                            m.scale, m.disp, ins.address + ins.size)
+                self.op_size = op.size or 4
+                break
+        if self.mem is None:
+            self.error = "Dieser Befehl greift nicht auf Speicher zu."
+
+    def start(self):
+        if self.error:
+            return
+        super().start()
+
+    def _on_hit(self, ctx):
+        self.hits[ctx["ip"]] += 1
+        base, index, scale, disp, next_ip = self.mem
+        if base in ("rip", "eip"):
+            addr = next_ip + disp
+        else:
+            b = ctx.reg(base) if base else 0
+            i = ctx.reg(index) if index else 0
+            if b is None or i is None:
+                return
+            addr = b + i * scale + disp
+        self.addresses[addr & (0xFFFFFFFF if self.proc.is32 else 0xFFFFFFFFFFFFFFFF)] += 1

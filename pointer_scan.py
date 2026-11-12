@@ -122,3 +122,37 @@ def chain_to_expr(proc, base, offsets):
 def rescan(proc, exprs, new_target):
     """Behaelt nur Ketten, die (jetzt) auf new_target zeigen."""
     return [e for e in exprs if resolve_expr(proc, e) == new_target]
+
+
+def find_refs(proc, target, max_offset=0x400, limit=500, progress=lambda f: None, cancel=None):
+    """'Wer zeigt hierhin?': alle Zeiger im Speicher auf [target - max_offset, target].
+
+    Liefert (fundort, offset, ist_statisch) – offset = target - Zeigerwert, also das Feld im
+    Objekt, auf dessen Anfang gezeigt wird. Statische Fundorte (in einem Modul) zuerst.
+    """
+    ps, dt = proc.ptr_size, proc.ptr_dtype
+    lo, hi = target - max_offset, target
+    regions = proc.regions(include_mapped=False)
+    total = sum(s for _, s in regions) or 1
+    done, out = 0, []
+    for base, size in regions:
+        off = 0
+        while off < size:
+            if cancel is not None and cancel.is_set():
+                return _sort_refs(out)
+            n = min(CHUNK, size - off)
+            arr = proc.read_array(base + off, n, dt)
+            if arr is not None:
+                for i in np.flatnonzero((arr >= lo) & (arr <= hi)):
+                    a = base + off + int(i) * ps
+                    out.append((a, target - int(arr[i]), proc.locate(a) is not None))
+            off += n
+            done += n
+            progress(done / total)
+            if len(out) >= limit * 4:
+                return _sort_refs(out)[:limit]
+    return _sort_refs(out)[:limit]
+
+
+def _sort_refs(refs):
+    return sorted(refs, key=lambda r: (not r[2], r[1], r[0]))

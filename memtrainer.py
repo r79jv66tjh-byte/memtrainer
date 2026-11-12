@@ -15,9 +15,10 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import gui_extra as gx
 import gui_tools as gt
-from scanner_core import (FIRST_MODES, HOTKEYS, NEEDS_V1, NEXT_MODES, TYPES, Process, Scanner,
-                          fmt_value, key_down, list_processes, parse_value, window_titles)
+from scanner_core import (FIRST_MODES, HOTKEYS, MULTI, NEXT_MODES, TYPE_CHOICES, MultiScanner,
+                          Process, Scanner, fmt_value, key_down, list_processes, window_titles)
 from trainer_core import (FREEZE_MODES, PATCH, CheatRunner, new_entry, parse_for_entry, table_from_json,
                           table_to_json)
 
@@ -267,6 +268,11 @@ class App(tk.Tk):
         self.next_iid = 0
         self.key_state = {}
         self.ticks = 0
+        self.unity = None          # geladene Unity-Laufzeit (gui_extra.UnityWindow)
+        self.row_sc = {}           # Treffer-iid -> (adresse, scanner)
+        self.scan_keys = {}        # Zustand der Scan-Hotkeys
+        self.pending_noise = 0     # Rauschfilter nach dem ersten Scan starten (Sekunden)
+        self.last_mode = ""
         self.table_process = ""
         self.speed_cfg = {}
         self.settings = load_settings()
@@ -291,6 +297,11 @@ class App(tk.Tk):
         w.add_command(label="Pointer-Scanner", command=lambda: self.need_proc() and gt.PointerScanWindow(self))
         w.add_command(label="Muster- & Textsuche (AOB)", command=lambda: self.need_proc() and gt.SearchWindow(self))
         w.add_command(label="Speedhack / Auto-Inject", command=lambda: gt.SpeedWindow(self))
+        w.add_separator()
+        w.add_command(label="Such-Assistent", command=lambda: gx.AssistantWindow(self))
+        w.add_command(label="Unity-Explorer (Werte per Name)", command=self.open_unity)
+        w.add_command(label="Struktur-Ansicht…", command=lambda: self.need_proc() and gx.StructWindow(self))
+        w.add_command(label="Werteverlauf der Treffer", command=self.history_selected_or_all)
         mb.add_cascade(label="Werkzeuge", menu=w)
         self.config(menu=mb)
 
@@ -301,7 +312,8 @@ class App(tk.Tk):
         self.proc_lbl.pack(side="left", padx=10)
         self.auto_lbl = ttk.Label(top, text="", foreground="#06c")
         self.auto_lbl.pack(side="left", padx=6)
-        for txt, cmd in (("Speedhack", lambda: gt.SpeedWindow(self)),
+        for txt, cmd in (("Unity", self.open_unity), ("Assistent", lambda: gx.AssistantWindow(self)),
+                         ("Speedhack", lambda: gt.SpeedWindow(self)),
                          ("Pointer-Scan", lambda: self.need_proc() and gt.PointerScanWindow(self)),
                          ("Suche (AOB/Text)", lambda: self.need_proc() and gt.SearchWindow(self)),
                          ("Speicher-Viewer", lambda: self.need_proc() and self.open_hex())):
@@ -316,8 +328,10 @@ class App(tk.Tk):
         left.pack(side="left", fill="both", expand=True)
         self.count_lbl = ttk.Label(left, text="Treffer: 0")
         self.count_lbl.pack(anchor="w")
-        self.res = ttk.Treeview(left, columns=("addr", "val", "prev"), show="headings", selectmode="extended")
-        for c, t, wd in (("addr", "Adresse", 220), ("val", "Wert", 120), ("prev", "Vorher", 120)):
+        self.res = ttk.Treeview(left, columns=("addr", "typ", "val", "prev"), show="headings", selectmode="extended")
+        self.res.tag_configure("up", foreground="#080")
+        self.res.tag_configure("down", foreground="#c00")
+        for c, t, wd in (("addr", "Adresse", 220), ("typ", "Typ", 100), ("val", "Wert", 110), ("prev", "Vorher", 110)):
             self.res.heading(c, text=t)
             self.res.column(c, width=wd, anchor="w")
         sb = ttk.Scrollbar(left, command=self.res.yview)
@@ -341,8 +355,8 @@ class App(tk.Tk):
         self.mode.set("Exakter Wert")
         self.mode.grid(row=5, column=0, columnspan=2, sticky="ew")
         ttk.Label(right, text="Datentyp").grid(row=6, column=0, sticky="w", pady=(6, 0))
-        self.vtype = ttk.Combobox(right, values=list(TYPES), state="readonly", width=20)
-        self.vtype.set("4 Bytes")
+        self.vtype = ttk.Combobox(right, values=TYPE_CHOICES, state="readonly", width=20)
+        self.vtype.set(MULTI)
         self.vtype.grid(row=7, column=0, columnspan=2, sticky="ew")
         self.mapped = tk.BooleanVar(value=False)
         ttk.Checkbutton(right, text="Gemappten Speicher mitscannen", variable=self.mapped).grid(
@@ -357,16 +371,22 @@ class App(tk.Tk):
         self.btn_cancel.grid(row=10, column=1, sticky="ew", pady=(4, 0), padx=(4, 0))
         self.pb = ttk.Progressbar(right, maximum=1.0)
         self.pb.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        self.status = ttk.Label(right, text="", wraplength=200, foreground="#555")
+        self.status = ttk.Label(right, text="", wraplength=210, foreground="#555")
         self.status.grid(row=12, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.btn_noise = ttk.Button(right, text="Rauschfilter (5 s)", command=self.noise_filter)
+        self.btn_noise.grid(row=13, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.hotkeys_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(right, text="Scan-Hotkeys (Strg+Num)", variable=self.hotkeys_on).grid(
+            row=14, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Button(right, text="Auswahl → Liste", command=self.add_selected).grid(
-            row=13, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+            row=15, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         help_txt = ("So geht's:\n1. Prozess wählen\n2. Wert eingeben → Erster Scan\n"
                     "3. Wert im Spiel ändern → Nächster Scan\n4. Wiederholen bis wenige Treffer\n"
-                    "5. Doppelklick → Liste\n6. Rechtsklick: Pointer-Scan, Was schreibt hierhin?…\n"
-                    "7. Datei → Trainer exportieren")
+                    "5. Doppelklick → Liste\n6. Rechtsklick: Verlauf, Struktur, Pointer-Scan…\n"
+                    "Hotkeys: Strg+Num+ / − / 0 / * / ÷\n= erhöht / verringert / gleich / geändert / exakt\n"
+                    "Unity-Spiel? → Knopf „Unity“")
         ttk.Label(right, text=help_txt, wraplength=210, foreground="#666", justify="left").grid(
-            row=14, column=0, columnspan=2, sticky="w", pady=(14, 0))
+            row=16, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         lower = ttk.Frame(pw)
         pw.add(lower, weight=2)
@@ -416,6 +436,7 @@ class App(tk.Tk):
         if self.proc:
             self.proc.close()
         self.proc, self.runner, self.speed = proc, CheatRunner(proc), None
+        self.unity = None
         self.new_scan()
         bits = "32-bit" if proc.is32 else "64-bit"
         self.proc_lbl.config(text=f"Verbunden: {name} (PID {pid}, {bits})", foreground="#070")
@@ -507,6 +528,7 @@ class App(tk.Tk):
         self.btn_new.config(state="disabled" if busy or first else "normal")
         self.btn_undo.config(state="normal" if not busy and self.scanner and self.scanner.history else "disabled")
         self.btn_cancel.config(state="normal" if busy else "disabled")
+        self.btn_noise.config(state="disabled" if busy else "normal")
         self.vtype.config(state="readonly" if first and not busy else "disabled")
         modes = FIRST_MODES if first else NEXT_MODES
         self.mode.config(values=modes)
@@ -520,27 +542,29 @@ class App(tk.Tk):
             messagebox.showinfo("Hinweis", "Bitte zuerst einen (laufenden) Prozess wählen.")
             return
         mode = self.mode.get()
-        dtype = TYPES[self.vtype.get()]
-        v1 = v2 = None
-        tol = 0
-        try:
-            if mode in NEEDS_V1:
-                v1, tol = parse_value(self.v1.get(), dtype)
-            if mode == "Zwischen":
-                v2, tol2 = parse_value(self.v2.get(), dtype)
-                tol = max(tol, tol2)
+        t1, t2 = self.v1.get(), self.v2.get()
+        first = self.scanner is None
+        if first:
+            sc = (MultiScanner(self.proc, self.mapped.get()) if self.vtype.get() == MULTI
+                  else Scanner(self.proc, self.vtype.get(), self.mapped.get()))
+        else:
+            sc = self.scanner
+        try:  # Eingabe vorab prüfen (im GUI-Thread, damit Fehler sofort sichtbar sind)
+            if isinstance(sc, MultiScanner):
+                if not sc._jobs(mode, t1, t2, first):
+                    raise ValueError("Der Wert passt zu keinem Datentyp.")
+            else:
+                sc.parse(mode, t1, t2)
         except ValueError as e:
             messagebox.showerror("Ungültiger Wert", str(e))
             return
-        first = self.scanner is None
-        sc = self.scanner or Scanner(self.proc, self.vtype.get(), self.mapped.get())
         self.cancel.clear()
         self.status.config(text="Scanne…")
-        fn = sc.first_scan if first else sc.next_scan
+        self.last_mode = mode
 
         def run():
             try:
-                ok = fn(mode, v1, v2, tol, progress=lambda f: self.q.put(("p", f)), cancel=self.cancel)
+                ok = sc.scan(first, mode, t1, t2, progress=lambda f: self.q.put(("p", f)), cancel=self.cancel)
                 self.q.put(("done", (sc, ok, None)))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("done", (sc, False, e)))
@@ -552,12 +576,103 @@ class App(tk.Tk):
     def scan_finished(self, sc, ok, err):
         self.worker = None
         if err:
-            messagebox.showerror("Scan-Fehler", repr(err))
+            messagebox.showerror("Scan-Fehler", str(err) if isinstance(err, ValueError) else repr(err))
         elif ok:
             self.scanner = sc
-        self.status.config(text="Abgebrochen" if not ok and not err else f"Scan {sc.scans} fertig")
+        txt = "Abgebrochen" if not ok and not err else f"Scan {sc.scans} fertig"
+        if ok and isinstance(sc, MultiScanner):
+            parts = [f"{k}: {v:,}".replace(",", ".") for k, v in sc.by_type().items() if v]
+            if parts:
+                txt += "\n" + " · ".join(parts)
+        self.status.config(text=txt)
+        if ok and self.hotkeys_on.get():
+            self.beep(sc.count())
         self.update_buttons()
         self.show_results()
+        if self.pending_noise and ok:
+            secs, self.pending_noise = self.pending_noise, 0
+            self.noise_filter(secs)
+        else:
+            self.pending_noise = 0
+
+    def beep(self, n):
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_OK if n else winsound.MB_ICONHAND)
+        except (ImportError, RuntimeError):
+            pass
+
+    # ---------------- Neue Hilfen ----------------
+    def noise_filter(self, seconds=5.0):
+        """Wiederholt 'Unverändert' scannen, während der Spieler nichts tut."""
+        if self.worker or not self.need_proc():
+            return
+        if self.scanner is None:
+            if not messagebox.askyesno("Rauschfilter", "Noch kein Scan vorhanden. Mit „Unbekannter Startwert“ "
+                                       "beginnen und dann 5 Sekunden filtern?\n\nIm Spiel solange nichts tun.",
+                                       parent=self):
+                return
+            self.mode.set("Unbekannter Startwert")
+            self.scan()
+            self.pending_noise = seconds
+            return
+        sc = self.scanner
+        self.cancel.clear()
+        self.status.config(text=f"Rauschfilter läuft ({seconds:g} s) – im Spiel nichts tun…")
+
+        def run():
+            try:
+                ok = sc.filter_noise(seconds, progress=lambda f: self.q.put(("p", f)), cancel=self.cancel)
+                self.q.put(("done", (sc, ok, None)))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("done", (sc, False, e)))
+
+        self.worker = threading.Thread(target=run, daemon=True)
+        self.worker.start()
+        self.update_buttons()
+
+    def preset_multi(self):
+        if self.scanner is None:
+            self.vtype.set(MULTI)
+        self.mode.set("Exakter Wert")
+        self.v1.focus_set()
+
+    def enable_hotkeys(self):
+        self.hotkeys_on.set(True)
+
+    def open_unity(self):
+        if self.need_proc():
+            gx.UnityWindow(self)
+
+    def watch(self, addr, size=4, access="w"):
+        return gt.WatchWindow(self, addr, size, access)
+
+    def history_selected_or_all(self):
+        if not self.proc:
+            return
+        iids = list(self.res.selection()) or list(self.res.get_children())[:6]
+        items = []
+        for iid in iids[:6]:
+            a, sc, _ = self.row_sc[iid]
+            items.append((sc.label, a, sc.type_name, sc.scale))
+        if not items:
+            messagebox.showinfo("Werteverlauf", "Keine Treffer vorhanden.", parent=self)
+            return
+        gx.HistoryWindow(self, items)
+
+    def scan_hotkeys(self):
+        """Strg + Ziffernblock steuert die Scans, während das Spiel im Vordergrund ist."""
+        ctrl = key_down(0x11)
+        keys = {0x6B: "Erhöht", 0x6D: "Verringert", 0x60: "Unverändert", 0x6A: "Geändert", 0x6F: "Exakter Wert"}
+        for vk, mode in keys.items():
+            down = ctrl and key_down(vk)
+            if down and not self.scan_keys.get(vk) and not self.worker and self.proc:
+                if self.scanner is None and mode != "Exakter Wert":
+                    self.beep(0)
+                else:
+                    self.mode.set(mode)
+                    self.scan()
+            self.scan_keys[vk] = down
 
     def show_results(self):
         self.res.delete(*self.res.get_children())
@@ -567,20 +682,26 @@ class App(tk.Tk):
         if not self.scanner.listable():
             self.count_lbl.config(text=f"Treffer: {n:,} – zu viele zum Anzeigen, weiter eingrenzen".replace(",", "."))
             return
-        rows = self.scanner.results(RESULT_LIMIT)
+        rows = self.scanner.rows(RESULT_LIMIT)
         extra = f" (zeige {len(rows)})" if n > len(rows) else ""
         self.count_lbl.config(text=f"Treffer: {n:,}{extra}".replace(",", "."))
-        for addr, prev in rows:
-            self.res.insert("", "end", iid=str(addr),
-                            values=(self.proc.fmt_addr(addr), fmt_value(prev), fmt_value(prev)))
+        self.row_sc = {}
+        for addr, sc, prev in rows:
+            iid = f"{addr}|{sc.label}"
+            self.row_sc[iid] = (addr, sc, prev)
+            pv = fmt_value(sc.display(prev))
+            self.res.insert("", "end", iid=iid, values=(self.proc.fmt_addr(addr), sc.label, pv, pv))
 
     def refresh_results(self):
+        """Live-Werte; grün = seit dem letzten Scan gestiegen, rot = gesunken."""
         if not self.proc or not self.scanner:
             return
-        dt = self.scanner.dtype
         for iid in self.res.get_children():
-            v = self.proc.read_value(int(iid), dt)
-            self.res.set(iid, "val", "??" if v is None else fmt_value(v))
+            addr, sc, prev = self.row_sc[iid]
+            v = self.proc.read_value(addr, sc.dtype)
+            tag = () if v is None or v == prev else (("up",) if v > prev else ("down",))
+            self.res.item(iid, tags=tag)
+            self.res.set(iid, "val", "??" if v is None else fmt_value(sc.display(v)))
 
     def res_menu(self, ev):
         iid = self.res.identify_row(ev.y)
@@ -588,11 +709,13 @@ class App(tk.Tk):
             return
         if iid not in self.res.selection():
             self.res.selection_set(iid)
-        a = int(iid)
-        size = self.scanner.size if self.scanner else 4
-        tname = self.scanner.type_name if self.scanner else "4 Bytes"
+        a, sc, _ = self.row_sc[iid]
+        size, tname = sc.size, sc.type_name
         m = tk.Menu(self, tearoff=0)
         m.add_command(label="→ Adressliste", command=self.add_selected)
+        m.add_command(label="Werteverlauf (live)", command=self.history_selected_or_all)
+        m.add_command(label="Struktur ansehen (Werte drumherum)", command=lambda: gx.StructWindow(self, max(0, a - 0x40) & ~0xF))
+        m.add_command(label="Wer zeigt hierhin?", command=lambda: gx.RefsWindow(self, a))
         m.add_command(label="Im Speicher-Viewer öffnen", command=lambda: self.open_hex(a))
         m.add_separator()
         m.add_command(label="Was schreibt auf diese Adresse?", command=lambda: gt.WatchWindow(self, a, size, "w"))
@@ -629,7 +752,9 @@ class App(tk.Tk):
         if not self.scanner or not self.proc:
             return
         for iid in self.res.selection():
-            self.add_entry(new_entry(expr=self.proc.fmt_addr(int(iid)), type=self.scanner.type_name))
+            addr, sc, _ = self.row_sc[iid]
+            desc = "Neuer Eintrag" if sc.scale == 1 else f"Wert ×{sc.scale} gespeichert"
+            self.add_entry(new_entry(desc=desc, expr=self.proc.fmt_addr(addr), type=sc.type_name))
 
     def add_manual(self):
         e = new_entry()
@@ -766,6 +891,10 @@ class App(tk.Tk):
             m.add_separator()
             m.add_command(label="Im Speicher-Viewer öffnen", command=lambda: self.open_hex(addr))
             if e["type"] != PATCH:
+                m.add_command(label="Werteverlauf (live)",
+                              command=lambda: gx.HistoryWindow(self, [(e["desc"], addr, e["type"], 1)]))
+                m.add_command(label="Struktur ansehen", command=lambda: gx.StructWindow(self, max(0, addr - 0x40) & ~0xF))
+                m.add_command(label="Wer zeigt hierhin?", command=lambda: gx.RefsWindow(self, addr))
                 m.add_command(label="Was schreibt auf diese Adresse?", command=lambda: gt.WatchWindow(self, addr, size, "w"))
                 m.add_command(label="Was greift auf diese Adresse zu?", command=lambda: gt.WatchWindow(self, addr, size, "rw"))
                 m.add_command(label="Pointer-Scan für diese Adresse",
@@ -841,6 +970,10 @@ class App(tk.Tk):
                         self.render_entry(iid)
                     self.key_state[(iid, k)] = down
             self.runner.tick(self.entries.values())
+            if self.hotkeys_on.get():
+                self.scan_hotkeys()
+            if self.ticks % 5 == 0 and not self.worker and len(self.row_sc) <= 200:
+                self.refresh_results()
             self.ticks += 1
             if self.ticks % 20 == 0:
                 if not self.proc.alive():

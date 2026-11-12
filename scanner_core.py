@@ -4,6 +4,7 @@ Nur Windows, 64-bit Python. Gedacht fuer Singleplayer-/Offline-Spiele.
 """
 import bisect
 import ctypes
+import time
 import ctypes.wintypes as wt
 
 import numpy as np
@@ -91,10 +92,17 @@ EXECUTABLE = 0x10 | 0x20 | 0x40 | 0x80
 TYPES = {"Byte": np.uint8, "2 Bytes": np.int16, "4 Bytes": np.int32,
          "8 Bytes": np.int64, "Float": np.float32, "Double": np.float64}
 
-FIRST_MODES = ["Exakter Wert", "Größer als", "Kleiner als", "Zwischen", "Unbekannter Startwert"]
-NEXT_MODES = ["Exakter Wert", "Größer als", "Kleiner als", "Zwischen", "Erhöht", "Verringert",
+APPROX = "Ungefähr (gerundet)"
+FIRST_MODES = ["Exakter Wert", APPROX, "Größer als", "Kleiner als", "Zwischen", "Unbekannter Startwert"]
+NEXT_MODES = ["Exakter Wert", APPROX, "Größer als", "Kleiner als", "Zwischen", "Erhöht", "Verringert",
               "Erhöht um", "Verringert um", "Geändert", "Unverändert"]
-NEEDS_V1 = {"Exakter Wert", "Größer als", "Kleiner als", "Zwischen", "Erhöht um", "Verringert um"}
+NEEDS_V1 = {"Exakter Wert", APPROX, "Größer als", "Kleiner als", "Zwischen", "Erhöht um", "Verringert um"}
+
+# "Alle Zahlentypen": diese Typen werden gleichzeitig gesucht (Typ, Faktor). Faktor 100 findet
+# z. B. Geld, das intern in Cent gespeichert ist (12,34 € -> 1234).
+MULTI = "Alle Zahlentypen"
+MULTI_SET = [("4 Bytes", 1), ("Float", 1), ("Double", 1), ("8 Bytes", 1), ("4 Bytes", 10), ("4 Bytes", 100)]
+TYPE_CHOICES = [MULTI] + list(TYPES)
 
 
 def list_processes():
@@ -172,10 +180,14 @@ def match(mode, cur, prev, v1, v2, tol):
     is_float = cur.dtype.kind == "f"
 
     def eq(a, v):
-        return np.abs(a - v) <= tol if is_float else a == v
+        if is_float:
+            return np.abs(a - v) <= tol
+        if tol:
+            return np.abs(a.astype(np.float64) - v) <= tol
+        return a == v
 
     with np.errstate(all="ignore"):
-        if mode == "Exakter Wert":
+        if mode in ("Exakter Wert", APPROX):
             return eq(cur, v1)
         if mode == "Größer als":
             return cur > v1
@@ -358,18 +370,78 @@ class Process:
         return bool(k32.WriteProcessMemory(self.h, addr, data, len(data), ctypes.byref(n)))
 
 
-class Scanner:
-    """Haelt die Trefferliste. blocks: base -> (indices|None, vorherige Werte)."""
+def _chunks(proc, include_mapped):
+    out = []
+    for base, size in proc.regions(include_mapped):
+        off = 0
+        while off < size:
+            n = min(CHUNK, size - off)
+            out.append((base + off, n))
+            off += n
+    return out
 
-    def __init__(self, proc, type_name, include_mapped=False):
+
+class Scanner:
+    """Haelt die Trefferliste. blocks: base -> (indices|None, vorherige Werte).
+
+    scale: gespeicherter Wert = angezeigter Wert * scale (z. B. 100 bei Cent-Beträgen).
+    """
+
+    def __init__(self, proc, type_name, include_mapped=False, scale=1):
         self.proc = proc
         self.type_name = type_name
+        self.scale = scale
         self.dtype = np.dtype(TYPES[type_name])
         self.size = self.dtype.itemsize
         self.include_mapped = include_mapped
         self.blocks = {}
         self.scans = 0
         self.history = []
+        self.last_changed = 0  # Treffer, deren Wert sich beim letzten Scan geändert hat
+
+    @property
+    def label(self):
+        return self.type_name + (f" ×{self.scale}" if self.scale != 1 else "")
+
+    def parse(self, mode, t1, t2=""):
+        """Eingabetexte -> (v1, v2, Toleranz) in gespeicherten Einheiten. ValueError, wenn unpassend."""
+        if mode not in NEEDS_V1:
+            return None, None, 0
+        v1, tol = self._parse_one(t1, mode)
+        v2 = None
+        if mode == "Zwischen":
+            v2, tol2 = self._parse_one(t2, mode)
+            tol = max(tol, tol2)
+        return v1, v2, tol
+
+    def _parse_one(self, text, mode):
+        t = (text or "").strip().replace(",", ".")
+        if self.scale == 1 or self.dtype.kind == "f":
+            v, tol = parse_value(text or "", self.dtype)
+            if mode == APPROX:
+                dec = len(t.split(".")[1]) if "." in t else 0
+                tol = max(tol, 1.0 if dec == 0 else 10.0 ** -dec)
+                if self.dtype.kind != "f":
+                    tol = 0.999
+            return v, tol
+        if not t:
+            raise ValueError("Bitte einen Wert eingeben.")
+        f = float(t) * self.scale
+        if mode == APPROX:
+            return f, self.scale * 0.999
+        if mode in ("Exakter Wert", "Erhöht um", "Verringert um") and abs(f - round(f)) > 1e-6:
+            raise ValueError("passt nicht zu diesem Faktor")
+        v = int(round(f))
+        info = np.iinfo(self.dtype)
+        if not info.min <= v <= info.max:
+            raise ValueError("Wert zu groß")
+        return v, 0
+
+    def display(self, raw):
+        """Gespeicherter Wert -> angezeigter Wert."""
+        if raw is None:
+            return None
+        return raw / self.scale if self.scale != 1 else raw
 
     def count(self):
         return sum(p.size for _, p in self.blocks.values())
@@ -378,36 +450,24 @@ class Scanner:
         return all(idx is not None for idx, _ in self.blocks.values())
 
     def first_scan(self, mode, v1, v2, tol, progress=lambda f: None, cancel=None):
-        chunks = []
-        for base, size in self.proc.regions(self.include_mapped):
-            off = 0
-            while off < size:
-                n = min(CHUNK, size - off)
-                chunks.append((base + off, n))
-                off += n
-        total = sum(n for _, n in chunks) or 1
-        done, blocks = 0, {}
-        for base, n in chunks:
-            if cancel is not None and cancel.is_set():
-                return False
-            arr = self.proc.read_array(base, n, self.dtype)
-            done += n
-            progress(done / total)
-            if arr is None:
-                continue
-            if mode == "Unbekannter Startwert":
-                blocks[base] = (None, arr)
-                continue
-            idx = np.flatnonzero(match(mode, arr, None, v1, v2, tol))
-            if idx.size:
-                blocks[base] = (idx.astype(np.uint32), arr[idx].copy())
-        self.blocks = blocks
-        self.scans = 1
-        return True
+        return first_scan_many([(self, v1, v2, tol)], mode, progress, cancel)
 
-    def next_scan(self, mode, v1, v2, tol, progress=lambda f: None, cancel=None):
+    def _first_chunk(self, base, raw, mode, v1, v2, tol):
+        """raw: gelesene Bytes (uint8). Bei 'Unbekannt' wird der Puffer geteilt statt kopiert."""
+        cnt = raw.size // self.size
+        if not cnt:
+            return
+        arr = raw[:cnt * self.size].view(self.dtype)
+        if mode == "Unbekannter Startwert":
+            self.blocks[base] = (None, arr)
+            return
+        idx = np.flatnonzero(match(mode, arr, None, v1, v2, tol))
+        if idx.size:
+            self.blocks[base] = (idx.astype(np.uint32), arr[idx].copy())
+
+    def next_scan(self, mode, v1, v2, tol, progress=lambda f: None, cancel=None, keep_history=False):
         items = sorted(self.blocks.items())
-        total, new = len(items) or 1, {}
+        total, new, changed = len(items) or 1, {}, 0
         for i, (base, (idx, prev)) in enumerate(items):
             if cancel is not None and cancel.is_set():
                 return False
@@ -421,6 +481,7 @@ class Scanner:
                 nidx = np.flatnonzero(match(mode, cur, prev, v1, v2, tol))
                 if nidx.size:
                     new[base] = (nidx.astype(np.uint32), cur[nidx].copy())
+                    changed += int(np.count_nonzero(cur[nidx] != prev[nidx]))
             else:
                 lo, hi = int(idx[0]), int(idx[-1])
                 arr = self.proc.read_array(base + lo * self.size, (hi - lo + 1) * self.size, self.dtype)
@@ -432,9 +493,29 @@ class Scanner:
                 m = match(mode, cur, prev, v1, v2, tol)
                 if m.any():
                     new[base] = (idx[m], cur[m].copy())
-        self.history.append((self.blocks, self.scans))
-        del self.history[:-5]  # max. 5 Schritte zurueck
+                    changed += int(np.count_nonzero(cur[m] != prev[m]))
+        if not keep_history:
+            self.history.append((self.blocks, self.scans))
+            del self.history[:-5]  # max. 5 Schritte zurueck
+            self.scans += 1
         self.blocks = new
+        self.last_changed = changed
+        return True
+
+    def filter_noise(self, seconds=5.0, progress=lambda f: None, cancel=None):
+        """'Rauschfilter': wiederholt 'Unverändert' scannen, solange der Spieler nichts tut.
+        Entfernt Zähler, Timer, Positionen usw. Zählt als ein Rückgängig-Schritt."""
+        state = (self.blocks, self.scans)
+        end = time.time() + seconds
+        while time.time() < end:
+            if cancel is not None and cancel.is_set():
+                self.blocks, self.scans = state
+                return False
+            self.next_scan("Unverändert", None, None, 0, cancel=cancel, keep_history=True)
+            progress(1 - max(0.0, end - time.time()) / seconds)
+            time.sleep(0.2)
+        self.history.append(state)
+        del self.history[:-5]
         self.scans += 1
         return True
 
@@ -455,6 +536,156 @@ class Scanner:
             if len(out) >= limit:
                 break
         return out
+
+    def rows(self, limit=500):
+        """(adresse, scanner, vorheriger Rohwert) – einheitlich für Einzel- und Mehrfach-Scan."""
+        return [(a, self, v) for a, v in self.results(limit)]
+
+    def scan(self, first, mode, t1, t2, progress=lambda f: None, cancel=None):
+        """Gemeinsame Schnittstelle mit MultiScanner: Werte aus Text parsen und scannen."""
+        v1, v2, tol = self.parse(mode, t1, t2)
+        fn = self.first_scan if first else self.next_scan
+        return fn(mode, v1, v2, tol, progress, cancel)
+
+    def by_type(self):
+        return {self.label: self.count()}
+
+
+def first_scan_many(jobs, mode, progress=lambda f: None, cancel=None):
+    """Erster Scan für mehrere Scanner auf einmal; jede Speicherseite wird nur einmal gelesen.
+    jobs: [(scanner, v1, v2, tol)]."""
+    if not jobs:
+        return True
+    proc, mapped = jobs[0][0].proc, jobs[0][0].include_mapped
+    chunks = _chunks(proc, mapped)
+    total = sum(n for _, n in chunks) or 1
+    new = {id(j[0]): {} for j in jobs}
+    old = [(j[0], j[0].blocks) for j in jobs]
+    for sc, *_ in jobs:
+        sc.blocks = new[id(sc)]
+    done = 0
+    for base, n in chunks:
+        if cancel is not None and cancel.is_set():
+            for sc, b in old:
+                sc.blocks = b
+            return False
+        raw = proc.read_array(base, n, np.uint8)
+        done += n
+        progress(done / total)
+        if raw is None:
+            continue
+        for sc, v1, v2, tol in jobs:
+            sc._first_chunk(base, raw, mode, v1, v2, tol)
+    for sc, *_ in jobs:
+        sc.scans = 1
+        sc.history = []
+    return True
+
+
+class MultiScanner:
+    """Sucht mehrere Datentypen gleichzeitig ('Alle Zahlentypen'). Gleiche Schnittstelle wie Scanner."""
+
+    type_name = label = MULTI
+    size = 4
+    scale = 1
+
+    def __init__(self, proc, include_mapped=False, combos=None):
+        self.proc = proc
+        self.include_mapped = include_mapped
+        self.subs = [Scanner(proc, t, include_mapped, sc) for t, sc in (combos or MULTI_SET)]
+        self.scans = 0
+        self.history = []  # Liste der Sub-Zustände für Rückgängig
+        self.skipped = []  # Typen, zu denen der Wert nicht passte
+
+    def count(self):
+        return sum(s.count() for s in self.subs)
+
+    def listable(self):
+        return all(s.listable() for s in self.subs)
+
+    @property
+    def last_changed(self):
+        return sum(s.last_changed for s in self.subs)
+
+    def _jobs(self, mode, t1, t2, first):
+        jobs, self.skipped = [], []
+        for s in self.subs:
+            if first and mode == "Unbekannter Startwert" and s.scale != 1:
+                continue  # skalierte Varianten verhalten sich bei Vergleichen gleich
+            if not first and not s.blocks:
+                continue
+            try:
+                jobs.append((s,) + s.parse(mode, t1, t2))
+            except (ValueError, OverflowError):
+                self.skipped.append(s.label)
+        return jobs
+
+    def scan(self, first, mode, t1, t2, progress=lambda f: None, cancel=None):
+        jobs = self._jobs(mode, t1, t2, first)
+        if not jobs:
+            raise ValueError("Der Wert passt zu keinem Datentyp.")
+        state = [(s, s.blocks, s.scans) for s in self.subs]
+        active = {id(j[0]) for j in jobs}
+        if first:
+            for s in self.subs:
+                s.blocks = {}
+            ok = first_scan_many(jobs, mode, progress, cancel)
+        else:
+            ok = True
+            for i, (s, v1, v2, tol) in enumerate(jobs):
+                ok = s.next_scan(mode, v1, v2, tol, lambda f, i=i: progress((i + f) / len(jobs)), cancel)
+                if not ok:
+                    break
+        if not ok:
+            for s, b, n in state:
+                s.blocks, s.scans = b, n
+            return False
+        for s in self.subs:
+            if id(s) not in active:
+                s.blocks = {}  # Typ passt nicht (mehr) -> verwerfen
+        if not first:
+            self.history.append(state)
+            del self.history[:-5]
+        self.scans = 1 if first else self.scans + 1
+        return True
+
+    def filter_noise(self, seconds=5.0, progress=lambda f: None, cancel=None):
+        state = [(s, s.blocks, s.scans) for s in self.subs]
+        end = time.time() + seconds
+        while time.time() < end:
+            if cancel is not None and cancel.is_set():
+                for s, b, n in state:
+                    s.blocks, s.scans = b, n
+                return False
+            for s in self.subs:
+                if s.blocks:
+                    s.next_scan("Unverändert", None, None, 0, cancel=cancel, keep_history=True)
+            progress(1 - max(0.0, end - time.time()) / seconds)
+            time.sleep(0.2)
+        self.history.append(state)
+        del self.history[:-5]
+        self.scans += 1
+        return True
+
+    def undo(self):
+        if not self.history:
+            return False
+        for s, b, n in self.history.pop():
+            s.blocks, s.scans = b, n
+        self.scans -= 1
+        return True
+
+    def rows(self, limit=500):
+        out = []
+        for s in self.subs:
+            if len(out) >= limit:
+                break
+            out.extend(s.rows(limit - len(out)))
+        return out
+
+    def by_type(self):
+        """{Typ-Label: Trefferzahl} – zeigt, welcher Datentyp wahrscheinlich ist."""
+        return {s.label: s.count() for s in self.subs if s.blocks}
 
 
 def key_down(vk):

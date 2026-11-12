@@ -1,96 +1,578 @@
 {
   "name": "MemTrainer",
-  "description": "Speicher-Scanner und Trainer für Singleplayer-Spiele: Prozesse finden, Werte (Gold, HP …) im Spielspeicher suchen, lesen und ändern, Byte-Muster/Text suchen, Spielgeschwindigkeit ändern. Nur für Offline-/Singleplayer-Spiele.",
+  "description": "Speicher-Scanner und Trainer für Singleplayer-Spiele: Werte (Gold, HP …) suchen – alle Zahlentypen auf einmal, Unity-Felder per Name –, live beobachten, Strukturen und Zeiger untersuchen, Befehle finden, die Werte ändern, Werte schreiben, Spielgeschwindigkeit ändern. Nur für Offline-/Singleplayer-Spiele.",
   "category": "Trainer",
-  "ignore": ["trainer_app.py"],
+  "ignore": [
+    "trainer_app.py"
+  ],
   "commands": [
     {
       "name": "processes",
       "description": "Laufende Prozesse auflisten (PID, exe-Name, Fenstertitel). Mit windows=true nur Programme mit Fenster, z. B. Spiele.",
-      "run": ["python", "cli.py", "processes"],
+      "run": [
+        "python",
+        "cli.py",
+        "processes"
+      ],
       "args": [
-        {"name": "filter", "flag": "--filter", "type": "string", "required": false, "description": "Teil von Name oder Fenstertitel"},
-        {"name": "windows", "flag": "--windows", "type": "boolean", "required": false, "description": "Nur Prozesse mit sichtbarem Fenster"}
+        {
+          "name": "filter",
+          "flag": "--filter",
+          "type": "string",
+          "required": false,
+          "description": "Teil von Name oder Fenstertitel"
+        },
+        {
+          "name": "windows",
+          "flag": "--windows",
+          "type": "boolean",
+          "required": false,
+          "description": "Nur Prozesse mit sichtbarem Fenster"
+        }
       ],
       "readonly": true
     },
     {
       "name": "scan",
-      "description": "Wert im Spielspeicher suchen. Erster Scan mit new=true, type und value (z. B. aktuelles Gold). Dann Wert im Spiel ändern lassen und erneut scan ohne new aufrufen (mode z. B. 'Exakter Wert' mit neuem Wert, 'Erhöht um', 'Verringert', 'Geändert', 'Unverändert'), bis wenige Treffer übrig sind. Liefert Adressen mit aktuellen Werten.",
-      "run": ["python", "cli.py", "scan"],
+      "description": "Wert im Spielspeicher suchen. Erster Scan mit new=true und value (z. B. aktuelles Gold). Standard-Typ 'Alle Zahlentypen' sucht 4/8 Bytes, Float, Double und Cent-Werte (×10/×100) gleichzeitig – by_type zeigt, welcher Typ passt. Dann Wert im Spiel ändern lassen und erneut scan ohne new aufrufen (mode z. B. 'Exakter Wert' mit neuem Wert, 'Ungefähr (gerundet)', 'Erhöht um', 'Verringert', 'Geändert', 'Unverändert'), bis wenige Treffer übrig sind. Bei Unity-Spielen zuerst unity-search versuchen.",
+      "run": [
+        "python",
+        "cli.py",
+        "scan"
+      ],
       "args": [
-        {"name": "process", "flag": "--process", "type": "string", "required": true, "description": "exe-Name oder PID des Spiels"},
-        {"name": "type", "flag": "--type", "type": "string", "required": false, "description": "Datentyp beim ersten Scan: 'Byte', '2 Bytes', '4 Bytes', '8 Bytes', 'Float', 'Double' (meist '4 Bytes')"},
-        {"name": "mode", "flag": "--mode", "type": "string", "required": false, "description": "Erster Scan: 'Exakter Wert', 'Größer als', 'Kleiner als', 'Zwischen'. Folgescans zusätzlich: 'Erhöht', 'Verringert', 'Erhöht um', 'Verringert um', 'Geändert', 'Unverändert'. Standard 'Exakter Wert'."},
-        {"name": "value", "flag": "--value", "type": "string", "required": false, "description": "Gesuchter Wert bzw. Differenz"},
-        {"name": "value2", "flag": "--value2", "type": "string", "required": false, "description": "Obergrenze bei 'Zwischen'"},
-        {"name": "new", "flag": "--new", "type": "boolean", "required": false, "description": "Neuen Scan beginnen (verwirft den alten)"},
-        {"name": "limit", "flag": "--limit", "type": "string", "required": false, "description": "Max. angezeigte Treffer (Standard 50)"}
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID des Spiels"
+        },
+        {
+          "name": "type",
+          "flag": "--type",
+          "type": "string",
+          "required": false,
+          "description": "Datentyp beim ersten Scan: 'Alle Zahlentypen' (Standard), 'Byte', '2 Bytes', '4 Bytes', '8 Bytes', 'Float', 'Double'"
+        },
+        {
+          "name": "mode",
+          "flag": "--mode",
+          "type": "string",
+          "required": false,
+          "description": "Erster Scan: 'Exakter Wert', 'Ungefähr (gerundet)', 'Größer als', 'Kleiner als', 'Zwischen'. Folgescans zusätzlich: 'Erhöht', 'Verringert', 'Erhöht um', 'Verringert um', 'Geändert', 'Unverändert'. Standard 'Exakter Wert'."
+        },
+        {
+          "name": "value",
+          "flag": "--value",
+          "type": "string",
+          "required": false,
+          "description": "Gesuchter Wert bzw. Differenz"
+        },
+        {
+          "name": "value2",
+          "flag": "--value2",
+          "type": "string",
+          "required": false,
+          "description": "Obergrenze bei 'Zwischen'"
+        },
+        {
+          "name": "new",
+          "flag": "--new",
+          "type": "boolean",
+          "required": false,
+          "description": "Neuen Scan beginnen (verwirft den alten)"
+        },
+        {
+          "name": "limit",
+          "flag": "--limit",
+          "type": "string",
+          "required": false,
+          "description": "Max. angezeigte Treffer (Standard 50)"
+        }
+      ],
+      "readonly": true
+    },
+    {
+      "name": "noise",
+      "description": "Rauschfilter für den laufenden Scan: einige Sekunden 'Unverändert' scannen, während der Spieler NICHTS tut. Entfernt Timer, Zähler, Positionen.",
+      "run": [
+        "python",
+        "cli.py",
+        "noise"
+      ],
+      "args": [
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID des Spiels"
+        },
+        {
+          "name": "seconds",
+          "flag": "--seconds",
+          "type": "string",
+          "required": false,
+          "description": "Dauer, Standard 5"
+        }
+      ],
+      "readonly": true
+    },
+    {
+      "name": "monitor",
+      "description": "Adressen live beobachten (Standard 5 s) und Änderungen mit Zeitstempel melden. Ideal, um zu prüfen, welche Adresse sich mit dem Spielwert ändert.",
+      "run": [
+        "python",
+        "cli.py",
+        "monitor"
+      ],
+      "args": [
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID des Spiels"
+        },
+        {
+          "name": "expr",
+          "flag": "--expr",
+          "type": "string",
+          "required": true,
+          "description": "Adresse/Ausdruck (Hex, Modul+Offset, Zeigerkette)"
+        },
+        {
+          "name": "type",
+          "flag": "--type",
+          "type": "string",
+          "required": false,
+          "description": "Datentyp, Standard '4 Bytes'"
+        },
+        {
+          "name": "seconds",
+          "flag": "--seconds",
+          "type": "string",
+          "required": false,
+          "description": "Dauer in Sekunden"
+        }
+      ],
+      "readonly": true
+    },
+    {
+      "name": "struct",
+      "description": "Speicher rund um eine Adresse als Felder (int, float, Zeiger) – zeigt verwandte Werte (z. B. HP neben Geld). Mit unity=true die echten Feldnamen bei Unity-Objekten.",
+      "run": [
+        "python",
+        "cli.py",
+        "struct"
+      ],
+      "args": [
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID des Spiels"
+        },
+        {
+          "name": "expr",
+          "flag": "--expr",
+          "type": "string",
+          "required": true,
+          "description": "Startadresse (Objektanfang)"
+        },
+        {
+          "name": "size",
+          "flag": "--size",
+          "type": "string",
+          "required": false,
+          "description": "Bytes, z. B. 0x100"
+        },
+        {
+          "name": "unity",
+          "flag": "--unity",
+          "type": "boolean",
+          "required": false,
+          "description": "Unity-Feldnamen anzeigen"
+        }
+      ],
+      "readonly": true
+    },
+    {
+      "name": "refs",
+      "description": "Wer zeigt auf diese Adresse? Findet Zeiger auf die Adresse bzw. den Objektanfang davor. static=true = stabile Zeigerkette auch nach Neustart.",
+      "run": [
+        "python",
+        "cli.py",
+        "refs"
+      ],
+      "args": [
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID des Spiels"
+        },
+        {
+          "name": "expr",
+          "flag": "--expr",
+          "type": "string",
+          "required": true,
+          "description": "Zieladresse"
+        },
+        {
+          "name": "max_offset",
+          "flag": "--max-offset",
+          "type": "string",
+          "required": false,
+          "description": "Max. Abstand zum Objektanfang (hex), Standard 400"
+        }
+      ],
+      "readonly": true
+    },
+    {
+      "name": "writes",
+      "description": "Was schreibt auf eine Adresse? Hängt sich einige Sekunden als Debugger an (Hardware-Breakpoint); währenddessen den Wert im Spiel ändern. Liefert die Befehle. Spiele mit Anti-Debug können abstürzen.",
+      "run": [
+        "python",
+        "cli.py",
+        "writes"
+      ],
+      "args": [
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID des Spiels"
+        },
+        {
+          "name": "expr",
+          "flag": "--expr",
+          "type": "string",
+          "required": true,
+          "description": "Adresse"
+        },
+        {
+          "name": "access",
+          "flag": "--access",
+          "type": "boolean",
+          "required": false,
+          "description": "Auch Lesezugriffe"
+        },
+        {
+          "name": "seconds",
+          "flag": "--seconds",
+          "type": "string",
+          "required": false,
+          "description": "Dauer, Standard 10"
+        },
+        {
+          "name": "dry_run",
+          "flag": "--dry-run",
+          "type": "boolean",
+          "required": false,
+          "description": "Nur beschreiben, nicht anhängen"
+        }
+      ],
+      "readonly": false
+    },
+    {
+      "name": "trace",
+      "description": "Welche Adressen nutzt dieser Befehl? Ausführungs-Breakpoint auf eine Befehlsadresse (aus 'writes'); zeigt alle Adressen, auf die dieser Code zugreift – z. B. Leben von Spieler und Gegnern.",
+      "run": [
+        "python",
+        "cli.py",
+        "trace"
+      ],
+      "args": [
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID des Spiels"
+        },
+        {
+          "name": "expr",
+          "flag": "--expr",
+          "type": "string",
+          "required": true,
+          "description": "Befehlsadresse"
+        },
+        {
+          "name": "seconds",
+          "flag": "--seconds",
+          "type": "string",
+          "required": false,
+          "description": "Dauer, Standard 5"
+        },
+        {
+          "name": "dry_run",
+          "flag": "--dry-run",
+          "type": "boolean",
+          "required": false,
+          "description": "Nur beschreiben, nicht anhängen"
+        }
+      ],
+      "readonly": false
+    },
+    {
+      "name": "unity-search",
+      "description": "Unity-Spiele (IL2CPP/Mono, 64-bit): Felder per Name finden, z. B. query='coins', 'gold', 'health' oder 'Player.hp'. Leer = typische Geld-Wörter. Schneller und genauer als Werte-Scans.",
+      "run": [
+        "python",
+        "cli.py",
+        "unity-search"
+      ],
+      "args": [
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID des Spiels"
+        },
+        {
+          "name": "query",
+          "flag": "--query",
+          "type": "string",
+          "required": false,
+          "description": "Suchbegriff(e)"
+        },
+        {
+          "name": "all_types",
+          "flag": "--all-types",
+          "type": "boolean",
+          "required": false,
+          "description": "Auch Nicht-Zahlen-Felder"
+        }
+      ],
+      "readonly": true
+    },
+    {
+      "name": "unity-objects",
+      "description": "Unity: alle Objekte einer Klasse finden und den Wert eines Feldes samt Adresse lesen (z. B. class='PlayerOptionsData', field='Coins'). Die Adresse kann dann mit write/monitor genutzt werden.",
+      "run": [
+        "python",
+        "cli.py",
+        "unity-objects"
+      ],
+      "args": [
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID des Spiels"
+        },
+        {
+          "name": "class",
+          "flag": "--class",
+          "type": "string",
+          "required": true,
+          "description": "Klassenname (mit oder ohne Namespace)"
+        },
+        {
+          "name": "field",
+          "flag": "--field",
+          "type": "string",
+          "required": true,
+          "description": "Feldname"
+        }
       ],
       "readonly": true
     },
     {
       "name": "read",
       "description": "Wert an einer Adresse lesen. Adresse als Hex (7FF6A1B2C3D0), Modul+Offset (game.exe+1A2B) oder Zeigerkette ([[game.exe+10]+48]+8).",
-      "run": ["python", "cli.py", "read"],
+      "run": [
+        "python",
+        "cli.py",
+        "read"
+      ],
       "args": [
-        {"name": "process", "flag": "--process", "type": "string", "required": true, "description": "exe-Name oder PID"},
-        {"name": "expr", "flag": "--expr", "type": "string", "required": true, "description": "Adresse/Ausdruck"},
-        {"name": "type", "flag": "--type", "type": "string", "required": false, "description": "Datentyp, Standard '4 Bytes'"}
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID"
+        },
+        {
+          "name": "expr",
+          "flag": "--expr",
+          "type": "string",
+          "required": true,
+          "description": "Adresse/Ausdruck"
+        },
+        {
+          "name": "type",
+          "flag": "--type",
+          "type": "string",
+          "required": false,
+          "description": "Datentyp, Standard '4 Bytes'"
+        }
       ],
       "readonly": true
     },
     {
       "name": "write",
       "description": "Wert an einer Adresse im Spiel ändern (z. B. Gold auf 99999). Mit dry_run nur Vorschau (alter/neuer Wert).",
-      "run": ["python", "cli.py", "write"],
+      "run": [
+        "python",
+        "cli.py",
+        "write"
+      ],
       "args": [
-        {"name": "process", "flag": "--process", "type": "string", "required": true, "description": "exe-Name oder PID"},
-        {"name": "expr", "flag": "--expr", "type": "string", "required": true, "description": "Adresse/Ausdruck"},
-        {"name": "type", "flag": "--type", "type": "string", "required": false, "description": "Datentyp, Standard '4 Bytes'"},
-        {"name": "value", "flag": "--value", "type": "string", "required": true, "description": "Neuer Wert"}
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID"
+        },
+        {
+          "name": "expr",
+          "flag": "--expr",
+          "type": "string",
+          "required": true,
+          "description": "Adresse/Ausdruck"
+        },
+        {
+          "name": "type",
+          "flag": "--type",
+          "type": "string",
+          "required": false,
+          "description": "Datentyp, Standard '4 Bytes'"
+        },
+        {
+          "name": "value",
+          "flag": "--value",
+          "type": "string",
+          "required": true,
+          "description": "Neuer Wert"
+        }
       ],
       "readonly": false
     },
     {
       "name": "aob",
       "description": "Byte-Muster im Speicher suchen, z. B. '89 46 ?? 8B 45' (?? = beliebig). Optional auf ein Modul beschränken.",
-      "run": ["python", "cli.py", "aob"],
+      "run": [
+        "python",
+        "cli.py",
+        "aob"
+      ],
       "args": [
-        {"name": "process", "flag": "--process", "type": "string", "required": true, "description": "exe-Name oder PID"},
-        {"name": "pattern", "flag": "--pattern", "type": "string", "required": true, "description": "Hex-Bytes mit ?? als Platzhalter"},
-        {"name": "module", "flag": "--module", "type": "string", "required": false, "description": "z. B. game.exe"}
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID"
+        },
+        {
+          "name": "pattern",
+          "flag": "--pattern",
+          "type": "string",
+          "required": true,
+          "description": "Hex-Bytes mit ?? als Platzhalter"
+        },
+        {
+          "name": "module",
+          "flag": "--module",
+          "type": "string",
+          "required": false,
+          "description": "z. B. game.exe"
+        }
       ],
       "readonly": true
     },
     {
       "name": "text",
       "description": "Text im Speicher suchen (Groß/Klein egal), z. B. einen Charakternamen.",
-      "run": ["python", "cli.py", "text"],
+      "run": [
+        "python",
+        "cli.py",
+        "text"
+      ],
       "args": [
-        {"name": "process", "flag": "--process", "type": "string", "required": true, "description": "exe-Name oder PID"},
-        {"name": "text", "flag": "--text", "type": "string", "required": true, "description": "Gesuchter Text"},
-        {"name": "utf16", "flag": "--utf16", "type": "boolean", "required": false, "description": "Als UTF-16 suchen (viele Windows-/Unity-Spiele)"}
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID"
+        },
+        {
+          "name": "text",
+          "flag": "--text",
+          "type": "string",
+          "required": true,
+          "description": "Gesuchter Text"
+        },
+        {
+          "name": "utf16",
+          "flag": "--utf16",
+          "type": "boolean",
+          "required": false,
+          "description": "Als UTF-16 suchen (viele Windows-/Unity-Spiele)"
+        }
       ],
       "readonly": true
     },
     {
       "name": "speed",
       "description": "Spielgeschwindigkeit ändern (Speedhack, nur 64-bit Spiele), z. B. factor 2 = doppelt so schnell, 1 = normal.",
-      "run": ["python", "cli.py", "speed"],
+      "run": [
+        "python",
+        "cli.py",
+        "speed"
+      ],
       "args": [
-        {"name": "process", "flag": "--process", "type": "string", "required": true, "description": "exe-Name oder PID"},
-        {"name": "factor", "flag": "--factor", "type": "string", "required": true, "description": "0.1 bis 10"}
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID"
+        },
+        {
+          "name": "factor",
+          "flag": "--factor",
+          "type": "string",
+          "required": true,
+          "description": "0.1 bis 10"
+        }
       ],
       "readonly": false
     },
     {
       "name": "table",
       "description": "Eine gespeicherte Cheat-Tabelle (.json) anzeigen, mit aktuellen Werten, falls das Spiel läuft.",
-      "run": ["python", "cli.py", "table"],
+      "run": [
+        "python",
+        "cli.py",
+        "table"
+      ],
       "args": [
-        {"name": "file", "flag": "--file", "type": "string", "required": true, "description": "Pfad zur Tabelle"},
-        {"name": "process", "flag": "--process", "type": "string", "required": false, "description": "Optional anderer Prozess"}
+        {
+          "name": "file",
+          "flag": "--file",
+          "type": "string",
+          "required": true,
+          "description": "Pfad zur Tabelle"
+        },
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": false,
+          "description": "Optional anderer Prozess"
+        }
       ],
       "readonly": true
     }
