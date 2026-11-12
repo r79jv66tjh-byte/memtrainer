@@ -134,7 +134,7 @@ class ActionsWindow(Tool):
             ("timer", "Timer", 90), ("last", "Letztes Ergebnis", 260))
 
     def __init__(self, app):
-        super().__init__(app, "Aktionen & Timer", "1060x420")
+        super().__init__(app, "Aktionen & Timer", "1060x640")
         bar = ttk.Frame(self, padding=6)
         bar.pack(fill="x")
         for text, fn in (("Neu…", self.new), ("Bearbeiten…", self.edit), ("▶ Ausführen", self.run),
@@ -148,6 +148,12 @@ class ActionsWindow(Tool):
             self.tv.column(c, width=w, anchor="w")
         self.tv.pack(fill="both", expand=True, padx=6)
         self.tv.bind("<Double-1>", lambda _: self.run())
+        ttk.Label(self, text="Verlauf (läuft gerade ⏳ / fertig ✓ / Fehler ✗):").pack(anchor="w", padx=6, pady=(8, 0))
+        self.hv = ttk.Treeview(self, columns=("time", "what", "dur", "res"), show="headings", height=9)
+        for c, t, w in (("time", "Zeit", 70), ("what", "Vorgang", 560), ("dur", "Dauer", 80), ("res", "Ergebnis", 300)):
+            self.hv.heading(c, text=t)
+            self.hv.column(c, width=w, anchor="w")
+        self.hv.pack(fill="both", expand=False, padx=6)
         ttk.Label(self, text="Aktionen rufen Funktionen des Spiels auf (nur Unity/IL2CPP). Sie werden mit der Tabelle "
                              "gespeichert. Was den Spielstand ändert (z. B. Freischalten), bleibt dauerhaft – vorher "
                              "den Spielstand sichern.", foreground="#555", wraplength=1000, justify="left"
@@ -177,6 +183,27 @@ class ActionsWindow(Tool):
         u = self.app.unity
         self.status.config(text="Unity bereit" if u else ("Unity wird geladen…" if self.app.unity_loading
                                                             else "Kein Unity-Spiel verbunden"))
+        self.fill_history()
+
+    def fill_history(self):
+        u = self.app.unity
+        rows = []
+        if self.app.unity_loading:
+            rows.append(("jetzt", "⏳ Unity-Daten laden", f"{time.time() - self.app.unity_loading:.1f} s", "läuft"))
+        if u is not None:
+            rows += [("jetzt", f"⏳ {t}", f"{d:.1f} s", "läuft") for t, d in u.running()]
+            rows += [(when, f"{'✓' if ok else '✗'} {text}", f"{dur:.2f} s" if dur >= 0.005 else "",
+                      msg or ("OK" if ok else "Fehler")) for when, text, dur, ok, msg in reversed(list(u.log))]
+        rows = rows[:200]
+        kids = self.hv.get_children()
+        for i, r in enumerate(rows):
+            if i < len(kids):
+                if self.hv.item(kids[i], "values") != r:
+                    self.hv.item(kids[i], values=r)
+            else:
+                self.hv.insert("", "end", values=r)
+        for k in kids[len(rows):]:
+            self.hv.delete(k)
 
     def _sel(self):
         s = self.tv.selection()

@@ -93,7 +93,7 @@ class CheatRunner:
             if self.unity is None:
                 return None
             try:
-                return self.unity.resolve_path(expr[6:])[0]
+                return self.unity.resolve_path(expr[6:], wait=False)[0]
             except Exception:  # noqa: BLE001 - ungültiger Pfad / Spiel im Ladebildschirm
                 return None
         return resolve_expr(self.proc, expr)

@@ -235,7 +235,11 @@ class RemoteCaller:
 
 H_FLAG, H_REQ = 0x400, 0x408   # Marke (0 frei, 1 Auftrag, 3 läuft, 2 fertig), Zeiger auf Auftrag
 H_THIS = 0x410                 # rcx beim letzten Aufruf (bei Methoden: das Objekt, „this“)
+H_ORIG = 0x420                 # Kennung + Länge + Original-Bytes (zum sicheren Aufräumen)
+H_MAGIC = b"MTHOOK1\0"
 H_STUB = 0x200
+STUB_SIG = b"\x48\x89\x0D"     # erster Befehl jedes Stubs: mov [rip+…],rcx
+_SHUTTING_DOWN = []
 
 
 def _relocate(code, src, dst):
@@ -301,6 +305,7 @@ _OPEN_HOOKS = set()
 
 
 def _close_open_hooks():
+    _SHUTTING_DOWN.append(True)  # ab jetzt keine neuen Hooks mehr (Hintergrund-Threads beim Beenden)
     for h in list(_OPEN_HOOKS):
         try:
             h.close()
@@ -313,6 +318,43 @@ import atexit  # noqa: E402
 atexit.register(_close_open_hooks)
 
 
+def leftover_target(proc, addr):
+    """Steht an addr ein Sprung in einen (alten) MemTrainer-Stub? Dann dessen Basisadresse, sonst None."""
+    b = proc.read_bytes(addr, 5)
+    if not b or b[0] != 0xE9:
+        return None
+    tgt = addr + 5 + struct.unpack("<i", b[1:5])[0]
+    base = tgt - H_STUB
+    if tgt & 0xFFF != H_STUB or proc.read_bytes(tgt, 3) != STUB_SIG:
+        return None
+    if any(h.base == base and h.proc.pid == proc.pid for h in list(_OPEN_HOOKS)):
+        return None  # gehört zu einem laufenden Hook dieses Programms
+    return base
+
+
+def heal_leftover(proc, addr):
+    """Rest eines nicht entfernten Hooks an addr rückgängig machen. True, wenn etwas repariert wurde."""
+    for _ in range(64):  # Ketten (Hook über Hook) von außen nach innen auflösen
+        base = leftover_target(proc, addr)
+        if base is None:
+            return _ > 0
+        info = proc.read_bytes(base + H_ORIG, 8 + 1 + 32)
+        if info and info[:8] == H_MAGIC:
+            orig = info[9:9 + info[8]]
+        else:  # alter Stub ohne gespeichertes Original: verschobenen Code zurückverschieben
+            _, rel_at = _stub(base, b"", 0)
+            code = proc.read_bytes(base + H_STUB + rel_at, 48) or b""
+            end = code.find(b"\xFF\x25\x00\x00\x00\x00")
+            if end < 5:
+                raise RemoteError("Alter Hook gefunden, aber nicht rückbaubar.")
+            orig, n = _relocate(code[:end], base + H_STUB + rel_at, addr)
+            if n != end:
+                raise RemoteError("Alter Hook gefunden, aber nicht rückbaubar.")
+        if not proc.write_bytes(addr, orig, code=True):
+            raise RemoteError("Alter Hook konnte nicht entfernt werden.")
+    return True
+
+
 class MainThreadHook:
     """Ruft Funktionen im Thread auf, der 'hook_addr' ausführt (z. B. Unitys Hauptthread).
 
@@ -323,6 +365,9 @@ class MainThreadHook:
     def __init__(self, proc, hook_addr, attach=(0, 0, 0)):
         if proc.is32:
             raise RemoteError("Nur für 64-bit Spiele.")
+        if _SHUTTING_DOWN:
+            raise RemoteError("MemTrainer wird beendet.")
+        heal_leftover(proc, hook_addr)  # Reste früherer Sitzungen nie als „Original“ übernehmen
         import threading
         self.lock = threading.Lock()
         self.proc, self.addr, self.attach = proc, hook_addr, attach
@@ -341,6 +386,7 @@ class MainThreadHook:
         self.rc.write(self.base, _batch_code())
         self.rc.write(self.base + H_STUB, stub)
         self.rc.write(self.base + H_FLAG, b"\0" * 24)
+        self.rc.write(self.base + H_ORIG, H_MAGIC + bytes([n]) + self.orig)
         jmp = b"\xE9" + struct.pack("<i", self.base + H_STUB - (hook_addr + 5)) + b"\x90" * (n - 5)
         if not proc.write_bytes(hook_addr, jmp, code=True):
             raise RemoteError("Einhängen fehlgeschlagen.")

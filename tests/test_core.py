@@ -133,6 +133,30 @@ class MainThreadHookTest(unittest.TestCase):
             t.close()
 
 
+class LeftoverHookTest(unittest.TestCase):
+    def test_leftover_hooks_are_healed(self):
+        """Ein nicht entfernter Hook (z. B. abgebrochenes Programm) darf nie als Original übernommen werden."""
+        t = Target()
+        try:
+            fn = remote.remote_exports(t.proc, "kernel32.dll")["GetTickCount64"]
+            orig = t.proc.read_bytes(fn, 16)
+            for legacy in (False, True):
+                a = remote.MainThreadHook(t.proc, fn)
+                remote._OPEN_HOOKS.discard(a)  # wie ein abgestürztes Programm: Hook bleibt stehen
+                if legacy:  # alter Stub ohne gespeichertes Original
+                    t.proc.write_bytes(a.base + remote.H_ORIG, b"\0" * 8)
+                self.assertIsNotNone(remote.leftover_target(t.proc, fn))
+                with remote.MainThreadHook(t.proc, fn) as b:
+                    self.assertEqual(b.orig, orig[:len(b.orig)])
+                    self.assertTrue(b.fires())
+                self.assertEqual(t.proc.read_bytes(fn, 16), orig)
+                a.hooked = False
+                a.rc.close()
+            t.send("add hp 1")
+        finally:
+            t.close()
+
+
 class TableActionsTest(unittest.TestCase):
     def test_actions_roundtrip(self):
         from trainer_core import new_action, new_entry, table_from_json, table_to_json

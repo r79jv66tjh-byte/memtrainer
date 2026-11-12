@@ -58,7 +58,12 @@ Format: `Klasse::Methode(arg1, arg2)`, mehrere mit `;`. Ein Objekt per Pfad: `Ga
 Enum-Argumente als Name oder Zahl; `*` = alle Werte; `keys:feld.dict` = alle Schlüssel eines Dictionary (z. B. nur
 die Inhalte, die es in dieser Spielversion wirklich gibt). Platzhalter/Test-Einträge (`VOID`, `…TEST…`) werden übersprungen.
 MemTrainer hängt sich dazu kurz an eine Funktion, die das Spiel jedes Bild aufruft (z. B. `GameManager.Update`), und
-führt den Aufruf im Hauptthread aus; beim Schließen wird der Originalcode wiederhergestellt.
+führt den Aufruf im Hauptthread aus; beim Schließen wird der Originalcode wiederhergestellt. Reste nicht sauber
+beendeter Sitzungen (Absturz, Task-Manager) erkennt MemTrainer beim nächsten Einhängen und entfernt sie.
+
+Was gerade im Hintergrund läuft (Unity laden, Objekt suchen, Aktionen) steht mit Dauer oben im Hauptfenster;
+der Verlauf mit Zeit, Dauer und Ergebnis steht unter Werkzeuge → „Aktionen & Timer“. Die Oberfläche wartet nie
+auf das Spiel – solange ein Objekt fehlt (Menü, Ladebildschirm), zeigen Einträge „??“.
 
 ### Preset Warhammer Survivors (Demo)
 Münzen (F5 = +1000), Leben (F1 einfrieren), Unverwundbar (F2), Level, XP (F3 = +500), Laufgeschwindigkeit;
@@ -90,8 +95,9 @@ Einfrieren, Hotkeys und Pointer-Scans bleiben der GUI bzw. dem exportierten Trai
   umgesetzt, aber bisher nur mit IL2CPP-Spielen getestet.
 - Aktionen/Methodenaufrufe: nur IL2CPP, höchstens 4 Register-Argumente (inkl. Objekt), keine Struct-Parameter wie
   Vector3; Rückgabewerte nur als Ganzzahl/Zeiger. Was eine Methode im Spiel auslöst, prüft MemTrainer nicht.
-- Unity-Pfade: Listen/Arrays mit `[i]`; das Wurzel-Objekt wird über sein `Update()` erkannt (sonst nur, wenn es genau
-  ein Objekt der Klasse gibt). Im Ladebildschirm/Hauptmenü zeigen Einträge „??“.
+- Unity-Pfade: Listen/Arrays mit `[i]`. Das Wurzel-Objekt kommt aus einem statischen Feld (Singleton, z. B.
+  `GM::Core`), sonst über sein laufendes `Update()`, sonst nur, wenn es genau ein Objekt der Klasse gibt.
+  Am schnellsten und sichersten sind Pfade ab einem statischen Feld (`Klasse::StatischesFeld.feld…`).
 - Speedhack wirkt über QueryPerformanceCounter/GetTickCount/timeGetTime – Spiele mit eigener Zeitmessung reagieren evtl. nicht.
 - Patches/Speedhack gelten nur, solange das Spiel läuft (beim nächsten Start neu aktivieren – der Trainer macht das automatisch).
 

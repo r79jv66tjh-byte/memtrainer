@@ -7,8 +7,11 @@ danach werden Objekte einer Klasse im Speicher gesucht und ihre Felder live gele
 Mit Anti-Cheat-Toolkit (ACTk) verschlüsselte Werte (ObscuredInt/Float/…) werden erkannt
 und – wenn möglich – entschlüsselt angezeigt.
 """
+import collections
+import contextlib
 import re
 import struct
+import threading
 import time
 
 import numpy as np
@@ -137,6 +140,31 @@ class UnityRuntime:
         self.loaded_all = False
         import threading
         self.lock = threading.RLock()  # Hook/Wurzel-Objekte aus GUI- und Aktions-Thread
+        self.tasks = {}                # laufende Hintergrund-Vorgänge: id -> (Text, Startzeit)
+        self.log = collections.deque(maxlen=300)  # (Uhrzeit, Text, Dauer s, ok, Meldung)
+        self._pending = set()
+
+    # -- Aktivitäten (für die Anzeige: was läuft gerade, wie lange) -----------------------
+    @contextlib.contextmanager
+    def activity(self, text, log=True):
+        key = object()
+        t0 = time.time()
+        self.tasks[key] = (text, t0)
+        ok, msg = True, ""
+        try:
+            yield
+        except Exception as e:  # noqa: BLE001 - nur mitschreiben, dann weiterreichen
+            ok, msg = False, str(e)
+            raise
+        finally:
+            self.tasks.pop(key, None)
+            if log:
+                self.log.append((time.strftime("%H:%M:%S", time.localtime(t0)), text, time.time() - t0, ok, msg))
+
+    def running(self):
+        """Laufende Vorgänge als [(Text, Sekunden)], älteste zuerst."""
+        now = time.time()
+        return [(t, now - t0) for t, t0 in sorted(list(self.tasks.values()), key=lambda x: x[1])]
 
     # -- Hilfen ---------------------------------------------------------------
     def fn(self, name, required=True):
@@ -485,7 +513,7 @@ class UnityRuntime:
             if not any(w in c.name.lower() for w in HOOK_PREFER) or _is_ui(c):
                 continue
             rest += [m for m in self.methods(c) if m.name in ("Update", "LateUpdate") and not m.params]
-            if len(rest) > 40:
+            if len(rest) > 12:
                 break
         return own, rest
 
@@ -496,6 +524,9 @@ class UnityRuntime:
     def _main_hook_impl(self, cls=None, timeout=1.0, progress=lambda t: None):
         """Hauptthread-Einhängung, wiederverwendet solange sie feuert. Bevorzugt cls.Update (liefert 'this')."""
         from remote import MainThreadHook
+        if not self.__dict__.get("_healed"):
+            self._healed = True
+            self.heal_leftovers()
         h = self.__dict__.get("_hook")
         if h is not None and h.hooked and (cls is None or getattr(h, "cls", None) is cls) and h.fires(0.5):
             return h
@@ -507,18 +538,39 @@ class UnityRuntime:
                 continue
             seen.add(m.fn)
             progress(f"Einhängen in {m.cls.name}.{m.name}…")
-            try:
-                h = MainThreadHook(self.proc, m.fn)
-            except RemoteError:
-                continue
-            if h.fires(timeout):
+            with self.activity(f"Teste {m.cls.name}.{m.name} als Einhängepunkt", log=False):
+                try:
+                    h = MainThreadHook(self.proc, m.fn)
+                except RemoteError:
+                    continue
+                fired = h.fires(timeout if m in own else min(timeout, 0.5))
+            if fired:
+                self.log.append((time.strftime("%H:%M:%S"), f"Eingehängt in {m.cls.name}.{m.name}", 0.0, True, ""))
                 h.cls = cls if m in own else None
                 h.method = m
                 self._hook = h
                 return h
             h.close()
+        self.log.append((time.strftime("%H:%M:%S"), "Kein Einhängepunkt gefunden", 0.0, False,
+                         "Spiel im Ladebildschirm/Menü?"))
         raise UnityError("Keine Funktion gefunden, die das Spiel gerade jedes Bild aufruft "
                          "(läuft das Spiel und ist es nicht im Ladebildschirm?).")
+
+    def heal_leftovers(self, cls=None):
+        """Reste früherer, nicht sauber beendeter Hooks an allen möglichen Einhängepunkten entfernen."""
+        from remote import heal_leftover
+        own, rest = self._frame_candidates(cls)
+        fixed = []
+        for m in {m.fn: m for m in own + rest if m.fn}.values():
+            try:
+                if heal_leftover(self.proc, m.fn):
+                    fixed.append(f"{m.cls.name}.{m.name}")
+            except RemoteError as e:
+                self.log.append((time.strftime("%H:%M:%S"), f"Alter Hook in {m.cls.name}.{m.name}", 0.0, False, str(e)))
+        if fixed:
+            self.log.append((time.strftime("%H:%M:%S"), f"{len(fixed)} alte Hook-Reste entfernt", 0.0, True,
+                             ", ".join(fixed)))
+        return fixed
 
     def close_hook(self):
         h = self.__dict__.pop("_hook", None)
@@ -652,33 +704,100 @@ class UnityRuntime:
             cache[key] = f
         return cache[key]
 
-    def root(self, cls, refresh=False):
+    def root(self, cls, refresh=False, wait=True):
+        """Lebendes Objekt der Klasse. wait=False (Oberfläche): nie blockieren – fehlt es, wird im
+        Hintergrund gesucht und None geliefert."""
+        obj = self.__dict__.get("_roots", {}).get(cls.ptr)
+        if obj and not refresh and self._is_obj(obj, cls):
+            return obj
+        if not wait:
+            self._root_async(cls)
+            return None
         with self.lock:
             return self._root_impl(cls=cls, refresh=refresh)
 
+    def _is_obj(self, obj, cls):
+        valid = self.__dict__.setdefault("_valid", {})
+        if cls.ptr not in valid:
+            valid[cls.ptr] = {c.ptr for c in self.subclasses(cls)}
+        return self.proc.read_ptr(obj) in valid[cls.ptr]
+
+    def _root_async(self, cls):
+        if cls.ptr in self._pending:
+            return
+        last = self.__dict__.setdefault("_root_try", {})
+        fails = self.__dict__.get("_root_fails", {}).get(cls.ptr, 0)
+        if fails and time.time() - last.get(cls.ptr, 0) < min(60, 5 * 2 ** fails):
+            return
+        self._pending.add(cls.ptr)
+
+        def work():
+            try:
+                self.root(cls, wait=True)
+            except Exception:  # noqa: BLE001 - steht im Verlauf
+                pass
+            finally:
+                self._pending.discard(cls.ptr)
+        threading.Thread(target=work, daemon=True).start()
+
     def _root_impl(self, cls, refresh=False):
-        """Lebendes Objekt der Klasse (zwischengespeichert, wird geprüft)."""
+        """Lebendes Objekt der Klasse: 1. statisches Singleton (z. B. GM.Core), 2. Objekt, dessen Update()
+        läuft, 3. einziges Objekt im Speicher. Fehlschläge werden mit wachsender Pause neu versucht."""
         roots = self.__dict__.setdefault("_roots", {})
-        valid = {c.ptr for c in self.subclasses(cls)}
         obj = roots.get(cls.ptr)
-        if obj and not refresh and self.proc.read_ptr(obj) in valid:
+        if obj and not refresh and self._is_obj(obj, cls):
             return obj
         last = self.__dict__.setdefault("_root_try", {})
-        if time.time() - last.get(cls.ptr, 0) < 3 and not refresh:
-            return None  # nicht dauernd neu suchen (Ladebildschirm)
+        fails = self.__dict__.setdefault("_root_fails", {})
+        wait_s = min(60, 5 * 2 ** fails.get(cls.ptr, 0)) if fails.get(cls.ptr) else 0
+        if not refresh and time.time() - last.get(cls.ptr, 0) < wait_s:
+            return None  # nicht dauernd neu suchen (Menü/Ladebildschirm)
+        t0, how = time.time(), ""
+        with self.activity(f"Suche laufendes {cls.name}-Objekt", log=False):
+            obj = self._static_singleton(cls)
+            how = "statisches Feld" if obj else ""
+            if not obj:
+                try:
+                    obj = self.live_instance(cls)
+                    how = "läuft im Spiel (Update)" if obj else ""
+                except (UnityError, RemoteError):
+                    obj = None
+            if not obj:
+                found = self.instances(cls, limit=2)
+                obj = found[0] if len(found) == 1 else None
+                how = "einziges Objekt" if obj else ""
         last[cls.ptr] = time.time()
-        try:
-            obj = self.live_instance(cls)
-        except (UnityError, RemoteError):
-            obj = None
-        if not obj:
-            found = self.instances(cls, limit=2)
-            obj = found[0] if len(found) == 1 else None
+        if obj:
+            fails.pop(cls.ptr, None)
+            self.log.append((time.strftime("%H:%M:%S", time.localtime(t0)), f"{cls.name}-Objekt gefunden",
+                             time.time() - t0, True, how))
+        else:
+            fails[cls.ptr] = fails.get(cls.ptr, 0) + 1
+            nxt = min(60, 5 * 2 ** fails[cls.ptr])
+            self.log.append((time.strftime("%H:%M:%S", time.localtime(t0)), f"{cls.name}: kein laufendes Objekt",
+                             time.time() - t0, False, f"Spiel im Menü/Ladebildschirm? Neuer Versuch in {nxt} s."))
         roots[cls.ptr] = obj
         return obj
 
-    def resolve_path(self, path):
-        """'GameManager::_mainCharacters[0]._currentHp' -> (Adresse, Field) oder (None, None)."""
+    def _static_singleton(self, cls):
+        """Objekt aus statischen Feldern vom Typ cls (Singleton-Muster wie GM.Core), wenn eindeutig."""
+        cache = self.__dict__.setdefault("_sfields", {})
+        if cls.ptr not in cache:
+            fs = [f for c in self.classes for f in c.fields if f.static and f.tenum == 0x12]
+            self.describe_types(fs)
+            cache[cls.ptr] = [f for f in fs if f.type_name == cls.full]
+        vals = {}
+        for f in cache[cls.ptr][:50]:
+            base = self.__dict__.setdefault("_sbase", {}).get(f.cls.ptr) or self.static_base(f.cls)
+            self._sbase[f.cls.ptr] = base
+            v = self.proc.read_ptr(base + f.offset) if base else 0
+            if v and self._is_obj(v, cls):
+                vals[v] = vals.get(v, 0) + 1
+        return max(vals, key=vals.get) if vals else None
+
+    def resolve_path(self, path, wait=True):
+        """'GameManager::_mainCharacters[0]._currentHp' -> (Adresse, Field) oder (None, None).
+        wait=False: blockiert nie (für die Oberfläche)."""
         cname, _, rest = path.partition("::")
         cls = self.class_by_name(cname.strip())
         steps = re.findall(r"[^.\[\]]+|\[\d+\]", rest)
@@ -692,7 +811,7 @@ class UnityRuntime:
             self._sbase[cls.ptr] = base
             addr, field = (base + first.offset if base else None), first
         else:
-            obj = self.root(cls)
+            obj = self.root(cls, wait=wait)
             addr, field = (obj + first.offset if obj else None), first
         rp = self.proc.read_ptr
         for st in steps[1:]:
@@ -721,7 +840,7 @@ class UnityRuntime:
     def run_call(self, text, timeout=5.0):
         """Ein oder mehrere Aufrufe (mit ';' getrennt). Liefert die Rückgabewerte aller Aufrufe."""
         out = []
-        with self.lock:
+        with self.lock, self.activity(f"Aktion: {text[:120]}"):
             for part in [x for x in text.split(";") if x.strip()]:
                 out += self._run_call_impl(text=part, timeout=timeout)
         return out
@@ -729,7 +848,7 @@ class UnityRuntime:
     def _run_call_impl(self, text, timeout=5.0):
         """'GameManager::RosaryDamage(true, 1.8)' oder 'GameManager::_playerOptions.UnlockStage(*)'
         im Hauptthread ausführen. Liefert die Liste der Rückgabewerte (rax)."""
-        m = re.fullmatch(r"\s*(.+?)::(?:(.+)\.)?(\w+)\s*\((.*)\)\s*", text)
+        m = re.fullmatch(r"\s*([^:(]+?)::(?:([^(]+)\.)?(\w+)\s*\((.*)\)\s*", text)
         if not m:
             raise UnityError("Aufruf bitte als Klasse::Methode(arg1, arg2) oder Klasse::feld.Methode(…).")
         cls = self.class_by_name(m.group(1).strip())

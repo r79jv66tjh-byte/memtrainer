@@ -320,6 +320,9 @@ class App(tk.Tk):
         self.proc_lbl.pack(side="left", padx=10)
         self.auto_lbl = ttk.Label(top, text="", foreground="#06c")
         self.auto_lbl.pack(side="left", padx=6)
+        self.bg_lbl = ttk.Label(top, text="", foreground="#8a5a00", cursor="hand2")
+        self.bg_lbl.pack(side="left", padx=6)
+        self.bg_lbl.bind("<Button-1>", lambda _: self.open_actions())
         for txt, cmd in (("Unity", self.open_unity), ("Assistent", lambda: gx.AssistantWindow(self)),
                          ("Speedhack", lambda: gt.SpeedWindow(self)),
                          ("Pointer-Scan", lambda: self.need_proc() and gt.PointerScanWindow(self)),
@@ -684,7 +687,7 @@ class App(tk.Tk):
         import unity
         if not unity.detect(self.proc) or self.proc.is32:
             return
-        self.unity_loading = True
+        self.unity_loading = time.time()
         proc = self.proc
 
         def work():
@@ -694,6 +697,24 @@ class App(tk.Tk):
                 rt = None
             self.q.put(("u", (proc, rt)))
         threading.Thread(target=work, daemon=True).start()
+
+    def background_text(self):
+        """Kurzanzeige laufender Hintergrund-Vorgänge (Unity laden, Objekt suchen, Aktionen) mit Dauer."""
+        if self.unity_loading:
+            return f"⏳ Unity-Daten werden geladen … {time.time() - self.unity_loading:.0f} s"
+        u = self.unity
+        if u is None:
+            return ""
+        run = u.running()
+        if run:
+            text, secs = run[0]
+            more = f" (+{len(run) - 1})" if len(run) > 1 else ""
+            return f"⏳ {text} … {secs:.1f} s{more}"
+        if u.log:
+            when, text, dur, ok, msg = u.log[-1]
+            if time.time() - time.mktime(time.strptime(time.strftime("%Y-%m-%d ") + when, "%Y-%m-%d %H:%M:%S")) < 15:
+                return f"{'✓' if ok else '✗'} {text}" + (f" ({dur:.1f} s)" if dur >= 0.05 else "") +                     (f" – {msg}" if msg and not ok else "")
+        return ""
 
     def open_actions(self):
         for w in self.winfo_children():
@@ -1090,6 +1111,8 @@ class App(tk.Tk):
             self.action_sched.tick(self.actions)
             if self.ticks % 40 == 0 and self.unity is None and self.needs_unity():
                 self.ensure_unity()
+            if self.ticks % 4 == 0:
+                self.bg_lbl.config(text=self.background_text())
             if self.hotkeys_on.get():
                 self.scan_hotkeys()
             if self.ticks % 5 == 0 and not self.worker and len(self.row_sc) <= 200:
