@@ -648,6 +648,46 @@
         }
       ],
       "readonly": false
+    },
+    {
+      "name": "unity-path",
+      "description": "Unity: stabilen Pfad (unity:Klasse::statischesFeld.feld…) zu einem Feld finden, der Neustarts übersteht. Ohne object: für alle Objekte der Klasse – Objekte ohne Pfad sind meist alte Kopien. Den Pfad dann als expr für read/write/monitor nutzen.",
+      "run": [
+        "python",
+        "cli.py",
+        "unity-path"
+      ],
+      "args": [
+        {
+          "name": "process",
+          "flag": "--process",
+          "type": "string",
+          "required": true,
+          "description": "exe-Name oder PID des Spiels"
+        },
+        {
+          "name": "class",
+          "flag": "--class",
+          "type": "string",
+          "required": true,
+          "description": "Klasse, z. B. PlayerOptionsData"
+        },
+        {
+          "name": "field",
+          "flag": "--field",
+          "type": "string",
+          "required": true,
+          "description": "Feld, z. B. Coins"
+        },
+        {
+          "name": "object",
+          "flag": "--object",
+          "type": "string",
+          "required": false,
+          "description": "Objektadresse (hex), sonst alle"
+        }
+      ],
+      "readonly": true
     }
   ]
 }

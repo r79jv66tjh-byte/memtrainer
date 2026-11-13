@@ -23,6 +23,7 @@ Läuft das Spiel als Administrator, muss auch der Scanner als Administrator lauf
 | **Such-Assistent**: Schritt-für-Schritt-Tipps passend zum aktuellen Stand | Knopf „Assistent“ |
 | **Unity-Explorer**: Werte per Name finden (z. B. `coins`) – IL2CPP und Mono, Objekte samt Live-Wert, entschlüsselt Anti-Cheat-Toolkit-Werte (🔓) | Knopf „Unity“ |
 | **Unity-Pfade** statt fester Adressen: `unity:GameManager::_mainCharacters[0]._currentHp` – findet das lebende Objekt selbst und übersteht Neustarts | Adressliste |
+| **Stabiler Pfad per Klick**: findet den Weg von einem statischen Feld zum gewählten Objekt (z. B. `GM::Core._playerOptions…Coins`) und trägt ihn ein – übersteht Neustarts | Unity → Objekt wählen → „Stabiler Pfad → Liste“ |
 | **Aktionen & Timer**: Spiel-Methoden aufrufen (IL2CPP), z. B. Kill-all – per Knopf, Hotkey oder alle n Sekunden | Werkzeuge |
 | **Methoden** einer Unity-Klasse ansehen und als Aktion übernehmen | Unity → „Methoden der Klasse…“ |
 | **Presets** für bestimmte Spiele (`presets/`), werden beim Verbinden angeboten – z. B. Warhammer Survivors | Datei → Preset laden |
@@ -45,6 +46,7 @@ Läuft das Spiel als Administrator, muss auch der Scanner als Administrator lauf
 ## Typischer Ablauf
 1. Prozess wählen (Filter nach Name/Fenstertitel)
    - Unity-Spiel (z. B. Vampire-Survivors-Engine)? → **Unity** → `coins` suchen → Doppelklick → Wert direkt da.
+     Das Objekt wählen, dessen Wert sich im Spiel ändert → **Stabiler Pfad → Liste** (übersteht Neustarts).
 2. Wert eingeben → **Erster Scan** (Typ „Alle Zahlentypen“); Wert im Spiel ändern → **Nächster Scan**; wiederholen
    - Wird der Wert gerundet angezeigt? → „Ungefähr (gerundet)“. Unbekannt? → „Unbekannter Startwert“ + Rauschfilter.
 3. Treffer doppelklicken → Adressliste
@@ -74,7 +76,7 @@ Alles freischalten (Charaktere, Waffen, Stages, PowerUps dieser Version – **da
 `cli.py` bietet die wichtigsten Funktionen als Kommandozeile mit JSON-Ausgabe; `toolhub.json` beschreibt sie für
 ToolHub, das sie Claude per MCP zur Verfügung stellt. Befehle: `processes`, `scan` (mehrstufig, Zustand in `%TEMP%\memtrainer`),
 `noise`, `monitor`, `struct`, `refs`, `writes`/`trace` (Debugger, mit `--dry-run`), `unity-search`, `unity-objects`,
-`unity-methods`, `unity-call` (mit `--dry-run`), `read`, `write` (mit `--dry-run`, auch mit `unity:`-Pfaden), `aob`,
+`unity-path`, `unity-methods`, `unity-call` (mit `--dry-run`), `read`, `write` (mit `--dry-run`, auch mit `unity:`-Pfaden), `aob`,
 `text`, `speed`, `table`.
 
 ```

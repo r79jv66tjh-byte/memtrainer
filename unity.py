@@ -208,6 +208,7 @@ class UnityRuntime:
             imgs = rc.batch([(self.fn("assembly_get_image"), a) for a in asms])
             names = rc.batch([(self.fn("image_get_name"), i) for i in imgs])
             images = [(img, strs.get(nm)) for img, nm in zip(imgs, names) if img]
+            self.image_ptrs = {img for img, _ in images}  # zum Prüfen fremder Klassenzeiger (safe_class)
             self.images = [nm for _, nm in images]
             if not all_assemblies:
                 images = [(i, nm) for i, nm in images if not nm.startswith(SKIP_IMAGES)]
@@ -696,7 +697,7 @@ class UnityRuntime:
         cache = self.__dict__.setdefault("_fcache", {})
         key = (klass_ptr, name)
         if key not in cache:
-            c = self.by_ptr.get(klass_ptr) or (self._load_single(klass_ptr) if klass_ptr else None)
+            c = self.safe_class(klass_ptr)
             f = None
             while c is not None and f is None:
                 f = next((x for x in c.fields if x.name == name or x.name == f"<{name}>k__BackingField"), None)
@@ -779,6 +780,159 @@ class UnityRuntime:
         roots[cls.ptr] = obj
         return obj
 
+    # -- Stabile Pfade finden ------------------------------------------------------------
+    def _ref_fields(self, cls):
+        """Instanz- (bzw. statische) Felder der Klasse inkl. Basisklassen, die Objekt-Referenzen enthalten."""
+        cache = self.__dict__.setdefault("_reff", {})
+        if cls.ptr in cache:
+            return cache[cls.ptr]
+        fs, k, depth = [], cls, 0
+        while k is not None and depth < 16:
+            fs += [f for f in k.fields if f.tenum in (0x12, 0x15, 0x1C, 0x14, 0x1D)]
+            kp = k.parent
+            k = self.by_ptr.get(kp) or (self._load_single(kp) if kp else None)
+            depth += 1
+        # Generische Felder können Structs sein (KeyValuePair, Nullable …). Nur List<…> folgen – erkannt am
+        # Typnamen. NICHT class_from_type benutzen: bei offenen Generics (Foo<T>) stürzt die Laufzeit ab.
+        gen = [f for f in fs if f.tenum == 0x15]
+        self.describe_types(gen)
+        out = [f for f in fs if f.tenum != 0x15 or (f.type_name or "").startswith("System.Collections.Generic.List<")]
+        cache[cls.ptr] = out
+        return out
+
+    def safe_class(self, kp):
+        """Klasse zu einem Zeiger – aber NUR wenn er sicher eine Klasse ist. Ein falscher Zeiger an die
+        Laufzeit (class_get_fields …) lässt das Spiel abstürzen; deshalb erst selbst prüfen."""
+        if not kp:
+            return None
+        c = self.by_ptr.get(kp)
+        if c is not None:
+            return c
+        if self.kind != "il2cpp":
+            return None  # Mono: nur bekannte Klassen
+        bad = self.__dict__.setdefault("_badk", set())
+        if kp in bad:
+            return None
+        img = self.proc.read_ptr(kp)  # Il2CppClass.image
+        name_p = self.proc.read_ptr(kp + 0x10)  # Il2CppClass.name
+        raw = self.proc.read_bytes(name_p, 64) if name_p else None
+        name = raw.split(b"\0", 1)[0] if raw else b""
+        if img not in getattr(self, "image_ptrs", ()) or not name or not all(32 < ch < 127 for ch in name):
+            bad.add(kp)
+            return None
+        try:
+            return self._load_single(kp)
+        except Exception:  # noqa: BLE001
+            bad.add(kp)
+            return None
+
+    def object_class(self, obj):
+        """Klasse eines Objekts (il2cpp: Kopf = Klasse; Mono: Kopf = VTable → Klasse) oder None."""
+        h = self.proc.read_ptr(obj) if obj else 0
+        if self.kind != "il2cpp":
+            h = self.proc.read_ptr(h) if h else 0
+        return self.safe_class(h)
+
+    def find_paths(self, target, max_depth=4, max_nodes=40000, limit=8, progress=lambda f: None, cancel=None):
+        """Wege von statischen Feldern zu einem Objekt, kürzeste zuerst, z. B.
+        'VampireSurvivors.Framework.GM::Core._playerOptions._currentSiloSaveData'.
+        Solche Pfade (mit 'unity:' und Feldnamen davor/danach) überstehen Neustarts."""
+        rp = self.proc.read_ptr
+        with self.activity("Suche stabilen Pfad (statische Felder → Objekt)"):
+            # 1. Wurzeln: alle statischen Referenz-Felder
+            # generische Klassen-Definitionen (Name mit `) haben keine eigenen statischen Daten
+            owners = [c for c in self.classes if "`" not in c.name and any(f.static for f in c.fields)]
+            roots = []
+            if self.kind == "il2cpp":
+                with self._caller() as rc:
+                    bases = rc.batch([(self.fn("class_get_static_field_data"), c.ptr) for c in owners])
+            else:  # nur schon initialisierte Klassen (class_vtable würde statische Konstruktoren auslösen)
+                try_vt = self.fn("class_try_get_vtable", required=False)
+                bases = [0] * len(owners)
+                if try_vt:
+                    with self._caller() as rc:
+                        vts = rc.batch([(try_vt, self.domain, c.ptr) for c in owners])
+                        data = rc.batch([(self.fn("vtable_get_static_field_data"), v) for v in vts if v])
+                    it = iter(data)
+                    bases = [next(it) if v else 0 for v in vts]
+            sb = self.__dict__.setdefault("_sbase", {})
+            for c, b in zip(owners, bases):
+                if not b:
+                    continue
+                sb[c.ptr] = b
+                for f in self._ref_fields(c):
+                    if f.static and f.offset >= 0:
+                        v = rp(b + f.offset)
+                        if v:
+                            roots.append((v, f"{c.full}::{f.name}", 1))
+            # Singletons (GM.Core, X.Instance …) zuerst – deren Pfade sind am stabilsten
+            single = ("core", "instance", "_instance", "s_instance", "singleton", "current", "main")
+            roots.sort(key=lambda r: r[1].split("::")[-1].lower() not in single)
+            # 2. Breitensuche über Referenz-Felder, Listen und Arrays
+            seen, found, queue = set(), [], collections.deque(roots)
+            nodes = 0
+            while queue and nodes < max_nodes and len(found) < limit:
+                if cancel is not None and cancel.is_set():
+                    break
+                obj, path, depth = queue.popleft()
+                if obj in seen:
+                    continue
+                seen.add(obj)
+                nodes += 1
+                if nodes % 500 == 0:
+                    progress(min(1.0, nodes / max_nodes))
+                if obj == target:
+                    found.append(path)
+                    continue
+                if depth >= max_depth:
+                    continue
+                cls = self.object_class(obj)
+                if cls is None:  # kein echtes Objekt (z. B. Zahl aus List<int>) – nie an die Laufzeit geben
+                    continue
+                name = cls.name or ""
+                if name.startswith("List`"):
+                    items, size = rp(obj + 0x10), self.proc.read_value(obj + 0x18, np.int32) or 0
+                    for i in range(min(max(size, 0), 64)):
+                        v = rp(items + 0x20 + 8 * i) if items else 0
+                        if v:
+                            queue.append((v, f"{path}[{i}]", depth + 1))
+                    continue
+                if name.endswith("[]"):
+                    n = self.proc.read_value(obj + 0x18, np.int64) or 0
+                    for i in range(min(max(n, 0), 64)):
+                        v = rp(obj + 0x20 + 8 * i)
+                        if v and self.proc.read_bytes(v, 1) is not None:
+                            queue.append((v, f"{path}[{i}]", depth + 1))
+                    continue
+                if name.startswith(("Dictionary`", "HashSet`", "Action", "Func`")) or cls.ns == "System":
+                    continue
+                for f in self._ref_fields(cls):
+                    if not f.static and f.offset > 0:
+                        v = rp(obj + f.offset)
+                        if v:
+                            queue.append((v, f"{path}.{f.name}", depth + 1))
+            progress(1.0)
+        # schönere Namen für Auto-Properties (resolve_path findet beide Schreibweisen)
+        out = [re.sub(r"<(\w+)>k__BackingField", r"\1", p) for p in found]
+        out.sort(key=lambda p: (p.count(".") + p.count("["), len(p)))
+        return out
+
+    def path_for_field(self, obj, field, **kw):
+        """Stabile 'unity:'-Ausdrücke für ein Feld eines Objekts (oder ein statisches Feld)."""
+        fname = re.sub(r"<(\w+)>k__BackingField", r"\1", field.name)
+        if field.static:
+            return [f"unity:{field.cls.full}::{fname}"]
+        res = []
+        for p in self.find_paths(obj, **kw):
+            expr = f"{p}.{fname}"
+            try:
+                a, _ = self.resolve_path(expr)
+            except UnityError:
+                a = None
+            if a == obj + field.offset:  # nur Pfade, die wirklich auf das Feld zeigen
+                res.append("unity:" + expr)
+        return res
+
     def _static_singleton(self, cls):
         """Objekt aus statischen Feldern vom Typ cls (Singleton-Muster wie GM.Core), wenn eindeutig."""
         cache = self.__dict__.setdefault("_sfields", {})
@@ -822,8 +976,7 @@ class UnityRuntime:
                 return None, None
             if st.startswith("["):
                 i = int(st[1:-1])
-                kp = rp(obj)
-                k = self.by_ptr.get(kp) or (self._load_single(kp) if kp else None)
+                k = self.object_class(obj)
                 if k is not None and k.name.startswith("List`"):  # List<T>: _items, _size
                     size = self.proc.read_value(obj + 0x18, np.int32)
                     if size is None or i >= size:
@@ -831,7 +984,10 @@ class UnityRuntime:
                     obj = rp(obj + 0x10)
                 addr, field = obj + 0x20 + 8 * i, None  # Array: Daten ab +0x20
                 continue
-            f = self._field_of(rp(obj), st)
+            oc = self.object_class(obj)  # prüft den Zeiger, bevor die Laufzeit ihn sieht
+            if oc is None:
+                return None, None
+            f = self._field_of(oc.ptr, st)
             if f is None:
                 return None, None
             addr, field = obj + f.offset, f
@@ -859,8 +1015,9 @@ class UnityRuntime:
             obj = self.proc.read_ptr(addr) if addr else 0
             if not obj:
                 raise UnityError(f"{m.group(2)} ist gerade leer (Spiel im Menü?).")
-            kp = self.proc.read_ptr(obj)
-            cls = self.by_ptr.get(kp) or self._load_single(kp)
+            cls = self.object_class(obj)
+            if cls is None:
+                raise UnityError(f"{m.group(2)} zeigt gerade auf kein gültiges Objekt.")
         else:
             obj = None
         cands = []

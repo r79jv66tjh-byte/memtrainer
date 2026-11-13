@@ -25,6 +25,33 @@ def _valid_ptr(proc, v):
     return bool(v) and 0x10000 <= v < (0xFFFFFFFF if proc.is32 else 0x7FFFFFFFFFFF) and proc.read_bytes(v, 1) is not None
 
 
+class PathPicker(tk.Toplevel):
+    """Gefundene stabile Pfade zur Auswahl (kürzester zuerst)."""
+
+    def __init__(self, master, paths, on_pick):
+        super().__init__(master)
+        self.title("Stabilen Pfad wählen")
+        self.geometry("900x300")
+        ttk.Label(self, text="Diese Pfade führen von einem statischen Feld zum Wert und überstehen Neustarts. "
+                             "Der oberste (kürzeste) ist meist der beste.", padding=6).pack(anchor="w")
+        self.lb = tk.Listbox(self, font=("Consolas", 9))
+        for p in paths:
+            self.lb.insert("end", p)
+        self.lb.selection_set(0)
+        self.lb.pack(fill="both", expand=True, padx=6)
+        self.lb.bind("<Double-1>", lambda _: self.ok())
+        b = ttk.Frame(self, padding=6)
+        b.pack(fill="x")
+        ttk.Button(b, text="→ Adressliste", command=self.ok).pack(side="right")
+        self.paths, self.on_pick = paths, on_pick
+
+    def ok(self):
+        s = self.lb.curselection()
+        if s:
+            self.on_pick(self.paths[s[0]])
+            self.destroy()
+
+
 # ---------------------------------------------------------------- Struktur-Ansicht
 class StructWindow(Tool):
     """Speicher rund um eine Adresse als Felder (int/float/Zeiger), live mit Änderungs-Markierung.
@@ -469,8 +496,8 @@ class UnityWindow(Tool):
         bar.pack(fill="x", pady=(0, 4))
         self.sel_lbl = ttk.Label(bar, text="Feld wählen → „Objekte suchen“ (Doppelklick)")
         self.sel_lbl.pack(side="left")
-        for txt, cmd in (("Struktur ansehen", self.struct), ("→ Adressliste", self.add),
-                         ("Objekte suchen", self.find_objects)):
+        for txt, cmd in (("Struktur ansehen", self.struct), ("Stabiler Pfad → Liste", self.stable_path),
+                         ("→ Adressliste", self.add), ("Objekte suchen", self.find_objects)):
             ttk.Button(bar, text=txt, command=cmd).pack(side="right", padx=(4, 0))
         self.pb = ttk.Progressbar(bar, maximum=1.0, length=140)
         self.pb.pack(side="right", padx=8)
@@ -622,6 +649,38 @@ class UnityWindow(Tool):
                                         "'Was schreibt hierhin?' und den Befehl per NOP ausschalten.", parent=self)
                     continue
             self.app.add_entry(new_entry(desc=name, expr=self.app.proc.fmt_addr(a), type=f.mem_type))
+
+    def stable_path(self):
+        """Weg von einem statischen Feld zum gewählten Objekt suchen → Eintrag, der Neustarts übersteht."""
+        f = self.field
+        sel = self.ov.selection() or self.ov.get_children()[:1]
+        if not f or not sel:
+            messagebox.showinfo("Stabiler Pfad", "Erst Objekte suchen und das echte Objekt wählen "
+                                "(das, dessen Wert sich im Spiel ändert).", parent=self)
+            return
+        o = self.objs[int(sel[0])][0]
+        u, prog = self.app.unity, self.prog
+        self.cancel.clear()
+        self.sel_lbl.config(text="Suche Weg von statischen Feldern zum Objekt … (Fortschritt rechts)")
+
+        def work():
+            return u.path_for_field(None if o == "statisch" else o, f,
+                                    progress=lambda x: prog.__setitem__("v", x), cancel=self.cancel)
+
+        def done(paths, err):
+            if err:
+                messagebox.showerror("Stabiler Pfad", str(err), parent=self)
+                return
+            if not paths:
+                self.sel_lbl.config(text="Kein Weg gefunden.")
+                messagebox.showinfo("Stabiler Pfad", "Kein Weg von einem statischen Feld gefunden (Tiefe 4).\n"
+                                    "Tipp: im Spiel weiterspielen (z. B. in einen Lauf gehen) und erneut versuchen, "
+                                    "oder die feste Adresse bzw. den Pointer-Scan nutzen.", parent=self)
+                return
+            self.sel_lbl.config(text=f"{len(paths)} stabile(r) Pfad(e) gefunden")
+            PathPicker(self, paths, lambda p: self.app.add_entry(new_entry(
+                desc=f"{f.cls.name}.{f.name.replace('k__BackingField', '').strip('<>')}", expr=p, type=f.mem_type)))
+        self.run_bg(work, done)
 
     def struct(self):
         for iid in self.ov.selection()[:1]:

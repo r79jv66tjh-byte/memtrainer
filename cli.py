@@ -12,6 +12,7 @@ Beispiele:
   python cli.py unity-search --process game.exe --query coins
   python cli.py unity-objects --process game.exe --class PlayerOptionsData --field Coins
   python cli.py read --process game.exe --expr "unity:GameManager::_mainCharacters[0]._currentHp" --type Float
+  python cli.py unity-path --process game.exe --class PlayerOptionsData --field Coins
   python cli.py unity-methods --process game.exe --class GameManager --query rosary
   python cli.py unity-call --process game.exe --call "GameManager::RosaryDamage(true, 1.8)" --dry-run
 """
@@ -414,6 +415,29 @@ def cmd_unity_methods(a):
                  "'keys:feld.dict' = Schlüssel eines Dictionary (z. B. vorhandene Inhalte)."})
 
 
+def cmd_unity_path(a):
+    """Stabilen unity:-Pfad (ab statischem Feld) zu einem Feld finden; ohne --object: alle Objekte der Klasse."""
+    p = open_process(a.process)
+    u = _unity(p)
+    cls = u.find_class(a.cls)
+    if not cls:
+        raise CliError(f"Klasse '{a.cls}' nicht gefunden.")
+    cls = cls[0]
+    f = u._field_of(cls.ptr, a.field)
+    if f is None:
+        raise CliError(f"Feld '{a.field}' gibt es in {cls.full} nicht.")
+    objs = [int(a.object, 16)] if a.object else ([None] if f.static else u.instances(cls, limit=a.limit))
+    rows = []
+    for o in objs:
+        paths = u.path_for_field(o, f)
+        addr = u.field_addr(f, o, u.static_base(cls) if f.static else 0)
+        rows.append({"object": p.fmt_addr(o) if o else "statisch", "value": u.read_field(addr, f) if addr else None,
+                     "paths": paths})
+    out({"process": p.name, "class": cls.full, "field": f.name, "mem_type": f.mem_type, "objects": rows,
+         "hint": "Pfad als --expr für read/write/monitor nutzen oder in eine Tabelle eintragen; übersteht Neustarts. "
+                 "Objekte ohne Pfad sind oft alte Kopien."})
+
+
 def cmd_unity_call(a):
     import unity
     p = open_process(a.process)
@@ -580,6 +604,14 @@ def main(argv=None):
     s.add_argument("--inherited", action="store_true")
     s.add_argument("--limit", type=int, default=200)
     s.set_defaults(fn=cmd_unity_methods)
+
+    s = sub.add_parser("unity-path")
+    s.add_argument("--process", required=True)
+    s.add_argument("--class", dest="cls", required=True)
+    s.add_argument("--field", required=True)
+    s.add_argument("--object")
+    s.add_argument("--limit", type=int, default=6)
+    s.set_defaults(fn=cmd_unity_path)
 
     s = sub.add_parser("unity-call")
     s.add_argument("--process", required=True)
