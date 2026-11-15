@@ -1,24 +1,17 @@
 """Zusätzliche Werkzeug-Fenster: Struktur-Ansicht, 'Wer zeigt hierhin?', Werteverlauf,
-'Welche Adressen nutzt dieser Befehl?', Unity-Explorer und Such-Assistent."""
+Unity-Explorer und Such-Assistent."""
 import struct
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-import numpy as np
-
-import debugger
 import pointer_scan
 from gui_tools import Tool, _hex_or_expr
 from scanner_core import TYPES, fmt_value
 from trainer_core import new_entry
 
 COLORS = ("#d62728", "#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf")
-
-
-def _type_size(type_name):
-    return np.dtype(TYPES.get(type_name, np.int32)).itemsize
 
 
 def _valid_ptr(proc, v):
@@ -373,71 +366,6 @@ class HistoryWindow(Tool):
                 pts += [x, y]
             if len(pts) >= 4:
                 cv.create_line(*pts, fill=COLORS[i % len(COLORS)], width=2)
-
-
-# ---------------------------------------------------------------- Welche Adressen nutzt dieser Befehl?
-class TracerWindow(Tool):
-    def __init__(self, app, ins_addr):
-        super().__init__(app, "Welche Adressen nutzt dieser Befehl?", "820x440")
-        self.tr = debugger.InstructionTracer(app.proc, ins_addr)
-        ttk.Label(self, text=f"Befehl: {app.proc.fmt_addr(ins_addr)}   {self.tr.text}\n"
-                             "Zeigt alle Adressen, auf die dieser Code zugreift – z. B. Leben von Spieler UND Gegnern. "
-                             "So erkennst du, ob ein Befehl nur deinen Wert betrifft.",
-                  foreground="#555", padding=6, wraplength=780, justify="left").pack(anchor="w")
-        self.tv = ttk.Treeview(self, columns=("addr", "n", "i32", "f32"), show="headings")
-        for c, t, w in (("addr", "Adresse", 260), ("n", "Zugriffe", 90), ("i32", "Wert (Int)", 140),
-                        ("f32", "Wert (Float)", 140)):
-            self.tv.heading(c, text=t)
-            self.tv.column(c, width=w, anchor="w")
-        self.tv.pack(fill="both", expand=True, padx=6)
-        self.tv.bind("<Double-1>", lambda _: self.add())
-        bar = ttk.Frame(self, padding=6)
-        bar.pack(fill="x")
-        self.btn = ttk.Button(bar, text="Stopp", command=self.stop)
-        self.btn.pack(side="left")
-        ttk.Button(bar, text="→ Adressliste", command=self.add).pack(side="left", padx=6)
-        ttk.Button(bar, text="Struktur ansehen", command=self.struct).pack(side="left")
-        self.status = ttk.Label(bar, text="", foreground="#070")
-        self.status.pack(side="right")
-        if self.tr.error:
-            self.status.config(text=self.tr.error, foreground="#b00")
-        else:
-            self.tr.start()
-            self.status.config(text="Debugger läuft…")
-        self.every(300, self.refresh)
-
-    def refresh(self):
-        if self.tr.error:
-            self.status.config(text=self.tr.error, foreground="#b00")
-        elif not self.tr.running:
-            self.status.config(text="Gestoppt", foreground="#555")
-        p = self.app.proc
-        for a, n in list(self.tr.addresses.items())[:500]:
-            iv = p.read_value(a, np.int32)
-            fv = p.read_value(a, np.float32)
-            vals = (p.fmt_addr(a), n, "??" if iv is None else iv, "??" if fv is None else fmt_value(fv))
-            if self.tv.exists(str(a)):
-                self.tv.item(str(a), values=vals)
-            else:
-                self.tv.insert("", "end", iid=str(a), values=vals)
-
-    def stop(self):
-        self.tr.stop()
-        self.btn.config(state="disabled")
-
-    def close(self):
-        self.tr.stop()
-        self.tr.join(3)
-        super().close()
-
-    def add(self):
-        t = "8 Bytes" if self.tr.op_size == 8 else "4 Bytes"
-        for iid in self.tv.selection():
-            self.app.add_entry(new_entry(desc="Von Befehl", expr=self.app.proc.fmt_addr(int(iid)), type=t))
-
-    def struct(self):
-        for iid in self.tv.selection()[:1]:
-            StructWindow(self.app, max(0, int(iid) - 0x40) & ~0xF)
 
 
 # ---------------------------------------------------------------- Unity-Explorer

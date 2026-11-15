@@ -21,7 +21,7 @@ import gui_extra as gx
 import gui_tools as gt
 from scanner_core import (FIRST_MODES, HOTKEYS, MULTI, NEXT_MODES, TYPE_CHOICES, MultiScanner,
                           Process, Scanner, fmt_value, key_down, list_processes, window_titles)
-from trainer_core import (FREEZE_MODES, PATCH, CheatRunner, new_entry, parse_for_entry, table_from_json,
+from trainer_core import (PATCH, CheatRunner, new_entry, parse_for_entry, table_from_json,
                           table_to_json)
 
 RESULT_LIMIT = 500
@@ -278,7 +278,6 @@ class App(tk.Tk):
         self.row_sc = {}           # Treffer-iid -> (adresse, scanner)
         self.scan_keys = {}        # Zustand der Scan-Hotkeys
         self.pending_noise = 0     # Rauschfilter nach dem ersten Scan starten (Sekunden)
-        self.last_mode = ""
         self.table_process = ""
         self.speed_cfg = {}
         self.settings = load_settings()
@@ -585,7 +584,6 @@ class App(tk.Tk):
             return
         self.cancel.clear()
         self.status.config(text="Scanne…")
-        self.last_mode = mode
 
         def run():
             try:

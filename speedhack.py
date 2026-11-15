@@ -19,7 +19,7 @@ _sig(k32.LoadLibraryW, wt.HMODULE, wt.LPCWSTR)
 _sig(k32.GetProcAddress, ctypes.c_void_p, wt.HMODULE, ctypes.c_char_p)
 
 # Daten-Offsets im reservierten Block
-SPEED, LOCK, LAST_REAL, FAKE, TICK_BASE, QPC_BASE, RTLQPC, TGT_BASE, MS_PER_TICK = 0, 8, 16, 24, 40, 48, 56, 64, 72
+SPEED, _LOCK, LAST_REAL, FAKE, TICK_BASE, QPC_BASE, RTLQPC, TGT_BASE, MS_PER_TICK = 0, 8, 16, 24, 40, 48, 56, 64, 72
 CODE = 0x100
 
 HOOKS = {  # Funktion -> (Module, in denen sie exportiert sein kann)
@@ -161,7 +161,6 @@ class SpeedHack:
         p.write_bytes(d, bytes(data) + bytes(code), code=True)
         self.data = d
         self.code = bytes(code)
-        self.code_addr = f
         target = {"QueryPerformanceCounter": q, "RtlQueryPerformanceCounter": q,
                   "GetTickCount64": t, "GetTickCount": t, "timeGetTime": tg}
         self.redirect = {a: target[fn] for a, fn in exports.items()}
@@ -184,7 +183,7 @@ class SpeedHack:
             desc = p.read_bytes(base + rva + i * 20, 20)
             if not desc:
                 return
-            oft, _, _, name, ft = struct.unpack("<IIIII", desc)
+            _oft, _, _, name, ft = struct.unpack("<IIIII", desc)
             if not name and not ft:
                 return
             for j in range(8192):

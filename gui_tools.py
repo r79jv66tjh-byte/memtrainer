@@ -28,7 +28,6 @@ class Tool(tk.Toplevel):
         self.app = app
         self.title(title)
         self.geometry(size)
-        self._job = None
         self.protocol("WM_DELETE_WINDOW", self.close)
 
     def every(self, ms, fn):
@@ -38,8 +37,8 @@ class Tool(tk.Toplevel):
                     fn()
                 except tk.TclError:
                     return
-                self._job = self.after(ms, loop)
-        self._job = self.after(ms, loop)
+                self.after(ms, loop)
+        self.after(ms, loop)
 
     def close(self):
         self.destroy()
