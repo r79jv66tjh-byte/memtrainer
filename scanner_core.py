@@ -83,7 +83,6 @@ _sig(k32.VirtualAllocEx, ctypes.c_void_p, wt.HANDLE, ctypes.c_void_p, ctypes.c_s
 _sig(k32.FlushInstructionCache, wt.BOOL, wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t)
 
 PAGE_EXECUTE_READWRITE = 0x40
-PAGE_READWRITE = 0x04
 MEM_RESERVE = 0x2000
 MEM_FREE = 0x10000
 READABLE = 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80

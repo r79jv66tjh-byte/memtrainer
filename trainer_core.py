@@ -187,11 +187,6 @@ class CheatRunner:
                     continue
             self.write(e, e["value"])
 
-    def deactivate_all(self, entries):
-        for e in entries:
-            if e["active"]:
-                self.set_active(e, False)
-
 
 def parse_for_entry(e, text):
     return parse_value(text, TYPES[e["type"]])[0]

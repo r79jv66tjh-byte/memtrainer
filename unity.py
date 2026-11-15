@@ -24,7 +24,7 @@ MONO_MODULES = ("mono-2.0-bdwgc.dll", "mono-2.0-sgen.dll", "mono.dll", "mono-2.0
 FIELD_STATIC = 0x10
 FIELD_LITERAL = 0x40
 
-# Il2CppTypeEnum == MonoTypeEnum
+# Il2CppTypeEnum uses the same values as MonoTypeEnum
 T_NAMES = {1: "void", 2: "bool", 3: "char", 4: "sbyte", 5: "byte", 6: "short", 7: "ushort", 8: "int",
            9: "uint", 10: "long", 11: "ulong", 12: "float", 13: "double", 14: "string", 0xF: "ptr",
            0x11: "struct", 0x12: "class", 0x13: "T", 0x14: "array", 0x15: "generic", 0x18: "nint",
@@ -490,16 +490,6 @@ class UnityRuntime:
                 meth.ret = (strs.get(tres[nt + len(owners) + i]) or "?").split(".")[-1]
         cache[cls.ptr] = out
         return out
-
-    def find_method(self, cls, name, nparams=None):
-        """Methode per Name in der Klasse oder ihren Basisklassen."""
-        k = cls
-        while k is not None:
-            for m in self.methods(k):
-                if m.name == name and (nparams is None or len(m.params) == nparams):
-                    return m
-            k = self.by_ptr.get(k.parent)
-        return None
 
     def _frame_candidates(self, cls=None):
         """Methoden, die vermutlich jedes Bild im Hauptthread laufen (Update…), beste zuerst."""
